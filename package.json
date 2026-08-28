@@ -1,0 +1,11 @@
+{
+  "name": "codex-windows-ssh",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check patch-codex-asar.mjs",
+    "test": "node patch-codex-asar.mjs --self-test"
+  },
+  "license": "MIT"
+}

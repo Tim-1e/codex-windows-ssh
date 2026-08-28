@@ -1,0 +1,8 @@
+.work/
+*.asar
+*.asar.*
+app/
+*.exe
+*.dll
+installed.json
+launcher.log

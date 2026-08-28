@@ -1,0 +1,109 @@
+# REFERENCE DESIGN ONLY — not directly git-applyable.
+#
+# The affected AppServerTransportSshWebsocket source is bundled in the signed
+# Codex Desktop MSIX and is not present in the public openai/codex repository.
+# The version-locked transformation is implemented by patch-codex-asar.mjs.
+
+diff --git a/desktop/main/app-server-transport-ssh-websocket.ts b/desktop/main/app-server-transport-ssh-websocket.ts
+--- a/desktop/main/app-server-transport-ssh-websocket.ts
++++ b/desktop/main/app-server-transport-ssh-websocket.ts
+@@
+ class AppServerTransportSshWebsocket {
++  private windowsDetected = false;
++  private windowsProxyPort: number | undefined;
++  private windowsController: SpawnedProcess | undefined;
++
+   async connect() {
+     const context = await this.prepareSshContext();
+-    await this.ensureRemoteAppServer(context);
++    const windows = await this.tryStartWindowsController(context);
++    if (!windows) {
++      // Existing Linux/macOS login-shell + Unix-socket path is unchanged.
++      await this.ensureRemoteAppServer(context);
++    }
+     return this.connectToRemoteAppServer(context);
+   }
++
++  private async tryStartWindowsController(context): Promise<boolean> {
++    this.disposeWindowsController();
++    const controller = spawnProcess({
++      args: [
++        "ssh", "-T", ...sshOptions(), ...sshDestination(),
++        "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
++        "-EncodedCommand", encodePowerShell(windowsControllerScript),
++      ],
++      collectOutput: false,
++      stdoutChunkHandler: (chunk: Buffer) => {
++        parseControllerLines(chunk.toString("utf8"));
++      },
++    });
++    this.windowsController = controller;
++
++    const result = await raceEndpointExitAndTimeout(controller);
++    if (
++      result.kind === "exit" &&
++      !result.sawWindowsMarker &&
++      (result.code === 127 || result.code === 87)
++    ) {
++      this.windowsDetected = false;
++      return false;
++    }
++    if (result.kind !== "endpoint") throw windowsSetupError(result);
++
++    this.windowsDetected = true;
++    this.windowsProxyPort = result.port;
++    return true;
++  }
+@@
+   createSshProxyStream(context) {
++    if (this.windowsProxyPort != null) {
++      return this.createWindowsDirectTcpStream(context, this.windowsProxyPort);
++    }
+     return this.createPosixSshProxyStream(context);
+   }
++
++  private createWindowsDirectTcpStream(context, port: number) {
++    const child = spawn(resolveExecutable("ssh") ?? "ssh", [
++      "-T", ...sshOptions(), "-W", `127.0.0.1:${port}`,
++      ...sshDestination(),
++    ], {
++      env: sanitizedEnv(process.env),
++      stdio: ["pipe", "pipe", "pipe"],
++      windowsHide: true,
++    });
++    return rawDuplexFromChild(child);
++  }
++
++  dispose() {
++    for (const stream of this.proxyStreams) stream.destroy();
++    this.proxyStreams.clear();
++    this.disposeWindowsController();
++  }
+ }
+
+diff --git a/desktop/main/app-server-transport-ssh-websocket.test.ts b/desktop/main/app-server-transport-ssh-websocket.test.ts
+--- a/desktop/main/app-server-transport-ssh-websocket.test.ts
++++ b/desktop/main/app-server-transport-ssh-websocket.test.ts
+@@
++test("parses controller Buffer chunks as UTF-8 lines", async () => {
++  controller.emitStdout(Buffer.from(
++    'CODEX_WINDOWS_ENDPOINT_V1 {"port":32123}\r\n', "utf8",
++  ));
++  await expect(transport.windowsEndpoint()).resolves.toEqual({ port: 32123 });
++});
++
++test("missing PowerShell falls back to the unchanged POSIX path", async () => {
++  controller.exit({ code: 127 });
++  await transport.connect();
++  expect(startPosixAppServer).toHaveBeenCalledTimes(1);
++});
++
++test("Windows uses loopback ssh -W and self-cleans", async () => {
++  await transport.connect();
++  expect(sshCommands).toContainEqual(
++    expect.arrayContaining(["-W", expect.stringMatching(/^127\.0\.0\.1:\d+$/)]),
++  );
++  client.close();
++  await expect(remoteControllerProcesses()).resolves.toHaveLength(0);
++  await expect(remoteAppServerListeners()).resolves.toHaveLength(0);
++});
