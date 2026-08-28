@@ -23,6 +23,18 @@ The current desktop build already groups remote work by project and renders the 
 
 Unknown bundle hashes fail closed. A Store update cannot silently receive an unreviewed patch.
 
+## Remote project grouping
+
+Desktop `26.820.7780.0` already groups saved SSH project folders in the same sidebar **Projects** section as local projects. Its resolver matches the remote host plus each chat's working directory to the saved remote project path; the project row keeps the built-in remote/globe indicator. This repository leaves that renderer unchanged.
+
+If remote chats still appear as individual globe-marked items under **Tasks**:
+
+1. fully exit every older Codex/ChatGPT desktop process;
+2. open the generated desktop or Start-menu **Codex** shortcut;
+3. in **Settings > Connections**, make sure each folder was saved as a remote project rather than only opening an unregistered remote working directory.
+
+The launcher refuses to mix two desktop runtime versions. Installing the new runtime does not change an already-running older window; that window must exit once before the new sidebar logic can load.
+
 ## Requirements
 
 - Windows with the Microsoft Store Codex desktop package installed
