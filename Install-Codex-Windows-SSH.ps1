@@ -10,7 +10,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = if ($ShowProgress) { 'Continue' } else { 'SilentlyContinue' }
-$script:ValidationSchemaVersion = 3
+$script:ValidationSchemaVersion = 4
 
 if ($EnableAutoUpdate -and $DisableAutoUpdate) {
     throw 'EnableAutoUpdate and DisableAutoUpdate cannot be used together.'

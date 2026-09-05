@@ -93,6 +93,8 @@ Taskbar pins are important: an older pin may point directly at a version directo
 
 The VBS launcher also normalizes repository, stable-root, and retained version-directory launches back to the canonical install root. Version pointers are written without a line terminator, while the reader still strips CR/LF for compatibility with older installations.
 
+The Windows notification-area (tray) icon uses Electron's default registration without the official signed application's fixed GUID. Windows binds an unsigned executable's tray GUID to its path, so reusing the official GUID after copying or updating the runtime can prevent the icon from appearing. The normal tray menu, including Quit, remains available. You can also quit from the app using **Ctrl+Q**.
+
 Disable automatic launch-time checks without uninstalling:
 
 ```powershell

@@ -59,7 +59,7 @@ jobs:
         shell: pwsh
         run: |
           $fixture = Join-Path $env:RUNNER_TEMP ("codex-launcher-" + [guid]::NewGuid().ToString('N'))
-          $runtimeId = '26.901.1978.0-r3'
+          $runtimeId = '26.901.1978.0-r4'
           $app = Join-Path $fixture "$runtimeId\app\ChatGPT.exe"
           New-Item -ItemType Directory -Path (Split-Path -Parent $app) -Force | Out-Null
           [IO.File]::WriteAllBytes($app, [byte[]]@())

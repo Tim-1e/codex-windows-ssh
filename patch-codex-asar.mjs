@@ -339,6 +339,14 @@ function patchMainBundle(source, controllerScript) {
   let patched = source.toString("utf8");
   const build = discoverMainBindings(patched);
   const updateMenu = discoverUpdateMenuBindings(patched);
+  const tray = matchExactlyOnce(
+    patched,
+    /(?<creation>new (?<electron>[A-Za-z_$][\w$]*)\.Tray\((?<image>[A-Za-z_$][\w$]*\.defaultIcon),process\.platform===`win32`&&(?<appElectron>[A-Za-z_$][\w$]*)\.app\.isPackaged\?(?<guid>[A-Za-z_$][\w$]*)\((?<flavor>[A-Za-z_$][\w$]*)\):void 0\))/gu,
+    "Windows tray creation",
+  );
+  if (tray.electron !== tray.appElectron || tray.electron !== updateMenu.electron) {
+    throw new Error("Inconsistent Electron binding in Windows tray creation");
+  }
   const replaceOnce = (needle, replacement, label) => {
     const first = patched.indexOf(needle);
     if (first < 0 || patched.indexOf(needle, first + needle.length) >= 0) {
@@ -361,6 +369,13 @@ function patchMainBundle(source, controllerScript) {
     updateMenu.handler,
     updateClickHandler,
     "desktop update menu handler",
+  );
+
+  // The copied EXE is unsigned. Reusing the signed app's GUID fails after relocation.
+  replaceOnce(
+    tray.creation,
+    `new ${tray.electron}.Tray(${tray.image}/* codex-windows-ssh: unsigned tray */)`,
+    "Windows tray creation",
   );
 
   replaceOnce(
@@ -445,6 +460,7 @@ function verifyArchive(archivePath) {
       "Check for updates requested via Codex Windows SSH.",
       "Update-Codex-Windows-SSH.ps1",
       "windowsHide:!0",
+      "codex-windows-ssh: unsigned tray",
     ]) {
       if (!source.includes(token)) {
         throw new Error(`Patched main bundle is missing: ${token}`);
@@ -557,6 +573,7 @@ function makeSyntheticMain(bindings) {
       "async runWithSshStartupGate(e){return e()}",
       "}",
       `const SyntheticUpdateMenu={click:()=>{${bindings.updateLogger}().info(\`Check for updates requested via menu.\`),${bindings.updateManager}.checkForUpdates().then(()=>{if(${bindings.updateManager}.hasUpdater())return;let e=${bindings.updateManager}.getUnavailableReason()??\`unknown\`;${bindings.updateLogger}().warning(\`Desktop updater unavailable; init likely skipped.\`,{safe:{reason:e},sensitive:{}}),${bindings.electron}.dialog.showMessageBox({type:\`info\`,title:\`Updates Unavailable\`,message:\`Automatic updates are unavailable right now.\`,detail:\`Updater initialization skipped: ${"${e}"}\`})})}};`,
+      `function SyntheticTray(n,t){return new ${bindings.electron}.Tray(n.defaultIcon,process.platform===\`win32\`&&${bindings.electron}.app.isPackaged?trayGuid(t):void 0)}`,
     ].join(""),
     "utf8",
   );
@@ -641,6 +658,7 @@ function selfTest() {
       if (
         !firstValue.includes("createWindowsSshProxyStream") ||
         !firstValue.includes("Update-Codex-Windows-SSH.ps1") ||
+        !firstValue.includes("new EL.Tray(n.defaultIcon/* codex-windows-ssh: unsigned tray */)") ||
         firstValue.includes("Automatic updates are unavailable right now.") ||
         !secondValue.equals(second)
       ) {
@@ -670,7 +688,10 @@ function selfTest() {
       electron: "eL",
     });
     const renamedResult = patchMainBundle(renamed, "Write-Output test");
-    if (!renamedResult.output.includes("env:n.hi(process.env)")) {
+    if (
+      !renamedResult.output.includes("env:n.hi(process.env)") ||
+      !renamedResult.output.includes("new eL.Tray(n.defaultIcon/* codex-windows-ssh: unsigned tray */)")
+    ) {
       throw new Error("Renamed binding self-test failed");
     }
 
