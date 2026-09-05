@@ -6,3 +6,6 @@ app/
 *.dll
 installed.json
 launcher.log
+task_plan.md
+findings.md
+progress.md

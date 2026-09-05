@@ -14,14 +14,11 @@ The current desktop build already groups remote work by project and renders the 
 - [OpenAI: Projects](https://learn.chatgpt.com/docs/projects)
 - [OpenAI: Open-source Codex components](https://learn.chatgpt.com/docs/open-source)
 
-## Supported desktop builds
+## Desktop compatibility
 
-| Desktop package | Main-bundle input SHA-256 | Status |
-|---|---|---|
-| `26.820.7780.0` | `3148e679...5d97e1` | Current; includes upstream remote-project grouping |
-| `26.803.10989.0` | `1b4fa622...26712` | Legacy transport baseline |
+The patcher is not tied to a package version or a full-bundle hash. It discovers the minified SSH helpers and desktop update-menu handler from the official bundle itself, cross-checks repeated bindings, and requires every semantic patch point to occur exactly once. The generated main bundle must then pass Node syntax, patch-structure, and ASAR integrity verification.
 
-Unknown bundle hashes fail closed. A Store update cannot silently receive an unreviewed patch.
+This means ordinary Store releases whose SSH transport keeps the same structure can be rebased without adding a version profile. It does **not** mean every future build is accepted blindly: a relevant upstream structural change fails closed and leaves the last working runtime selected. The structural patcher is regression-tested against desktop `26.820.7780.0` and `26.901.1978.0`.
 
 ## Remote project grouping
 
@@ -51,18 +48,61 @@ Close all Codex/ChatGPT desktop processes before the first patched launch, then 
 pwsh -NoProfile -File .\Install-Codex-Windows-SSH.ps1
 ```
 
-Open the new **Codex** desktop or Start-menu shortcut. It uses the official icon and the same user data, projects, and Codex home as the Store app.
+Open the new **Codex** desktop or Start-menu shortcut. It uses the official icon and the same user data, projects, and Codex home as the Store app. To keep it on the taskbar, pin the **Codex** Start-menu entry once; do not pin the running Store-app window.
 
 The installer:
 
 1. resolves the currently registered Store package and checks the official executable signature;
-2. accepts only a reviewed main-bundle SHA-256;
-3. rewrites the ASAR locally and verifies its syntax and integrity blocks;
-4. creates an isolated runtime under `%LOCALAPPDATA%\OpenAI\Codex-Windows-SSH\<version>`;
+2. discovers and cross-checks the official SSH transport bindings;
+3. rewrites the ASAR locally, synchronizes Electron's embedded `ElectronAsar` header hash in the copied executable, and verifies both integrity layers;
+4. creates an isolated runtime under `%LOCALAPPDATA%\OpenAI\Codex-Windows-SSH\<official-version>-r<patch-revision>`;
 5. when an older user-owned patched runtime exists, hardlinks byte-identical files from it and copies only files changed by the Store update;
-6. creates a normal-looking `Codex` shortcut.
+6. builds a tiny stable taskbar host that immediately hands off to the VBS launcher, creates stable desktop and Start-menu shortcuts, and migrates any existing taskbar pin already owned by this project. The `current.version` pointer is switched only after a new runtime is complete.
 
-The signed WindowsApps package is never modified. Windows does not allow an ordinary user to create hardlinks directly from the protected WindowsApps tree, so a first install requires a regular runtime copy. Later version upgrades reuse the existing user-owned runtime and are much lighter.
+The signed WindowsApps package is never modified. The installer verifies that upstream signature before copying. Synchronizing the copied executable's Electron integrity resource intentionally removes Authenticode from that user-owned copy; validation therefore checks its exact ASAR/resource pair instead. Windows does not allow an ordinary user to create hardlinks directly from the protected WindowsApps tree, so a first install requires a regular runtime copy. Later version upgrades reuse the existing user-owned runtime and are much lighter; `ChatGPT.exe` itself is always copied rather than hardlinked before its resource is changed.
+
+## Updating
+
+The Microsoft Store package and this patched runtime are separate update surfaces. The official desktop app normally receives its own updates; rerunning the installer rebases the SSH patch onto whatever signed Store package is currently registered:
+
+```powershell
+pwsh -NoProfile -File .\Install-Codex-Windows-SSH.ps1
+```
+
+No source change or version-profile edit is needed while the SSH transport remains structurally compatible.
+
+To enable automatic checks before each patched Codex launch, run once:
+
+```powershell
+pwsh -NoProfile -File .\Install-Codex-Windows-SSH.ps1 -EnableAutoUpdate
+```
+
+The Microsoft Store remains responsible for installing the signed official package. On launch, this project compares that registered official version with the selected patched runtime. A current, validated build adds only a quick hidden check. When the official package changes—or an older build lacks the current validation stamp—a visible PowerShell progress bar covers upstream signature verification, compatibility checking, patching, runtime assembly, embedded-ASAR synchronization, ASAR verification, and bundled-CLI startup verification. The validated runtime is selected atomically and used by that same launch.
+
+The patched app's **Help > Check for Updates** item uses the same project updater instead of Electron's unavailable packaged-app updater. An already-current check stays hidden until it shows a small result dialog; a required rebuild opens the visible progress window and reports success or failure. An active Codex process is never hot-swapped, so restart Codex after a newly selected runtime is built.
+
+The `-r<patch-revision>` suffix is independent of the Store version. It lets a new launcher, validation rule, or menu patch be published beside a running older patch of the same official release. Only after the new directory passes every check does `current.version` atomically switch to that runtime ID; the stable taskbar entry follows the pointer on the next launch.
+
+The last update result, including the official version and selected runtime ID, is recorded in `%LOCALAPPDATA%\OpenAI\Codex-Windows-SSH\last-update.json`. The launcher's last selected path and outcome are recorded in `last-launch.txt`; after dispatch it waits in the background for 1.2 seconds and records `running`, `exited-early`, or `dispatched-unverified`, so a native startup crash is no longer reported as success. A failed check leaves `current.version` unchanged and starts the last validated runtime. You can inspect update state without changing anything:
+
+```powershell
+pwsh -NoProfile -File .\Update-Codex-Windows-SSH.ps1 -Status
+```
+
+Taskbar pins are important: an older pin may point directly at a version directory, or retain the Store package's hidden `com.openai.codex` application ID even after its visible target changes. The installer recreates only links already owned by this project, which clears stale package identity without touching unrelated pins. Windows 11 requires the user to approve adding a new pin, so if no project-owned pin exists, right-click the **Codex** Start-menu entry and choose **Pin to taskbar** once. Its target is the stable `CodexLauncher.exe`, which still follows the VBS route and never points at a numbered runtime. The stable icon is stored at `%LOCALAPPDATA%\OpenAI\Codex-Windows-SSH\Codex.ico` so future version cleanup cannot break it.
+
+The VBS launcher also normalizes repository, stable-root, and retained version-directory launches back to the canonical install root. Version pointers are written without a line terminator, while the reader still strips CR/LF for compatibility with older installations.
+
+Disable automatic launch-time checks without uninstalling:
+
+```powershell
+pwsh -NoProfile -File .\Install-Codex-Windows-SSH.ps1 -DisableAutoUpdate
+```
+
+Desktop app updates do not update Codex CLI installations on SSH hosts. If the connection UI asks for a CLI update, update `codex` on that host using the same official installation method originally used there, then reconnect.
+
+- [OpenAI: Manage app updates](https://learn.chatgpt.com/docs/enterprise/manage-app-updates)
+- [OpenAI: Codex CLI](https://learn.chatgpt.com/docs/codex/cli)
 
 ## Connection flow
 
@@ -85,6 +125,8 @@ node .\patch-codex-asar.mjs --check "C:\path\to\official\app.asar"
 node .\patch-codex-asar.mjs --verify "C:\path\to\patched\app.asar"
 ```
 
+Every push and pull request also runs [`.github/workflows/validate.yml`](.github/workflows/validate.yml) on Windows. It executes the structural SSH/update-menu patcher self-test, parses every PowerShell script plus the VBScript launcher, compiles and self-tests the Electron integrity tool, compiles the stable taskbar host, and regression-tests both EXE-to-VBS and stable/version-local VBS resolution with a legacy trailing-LF pointer. The installer supplies the package-dependent validation that CI cannot run without redistributing the official app.
+
 ## Uninstall
 
 Exit the patched desktop app, then run:
@@ -93,11 +135,11 @@ Exit the patched desktop app, then run:
 pwsh -NoProfile -File .\Uninstall-Codex-Windows-SSH.ps1
 ```
 
-This removes only the owned shortcut and `%LOCALAPPDATA%\OpenAI\Codex-Windows-SSH`. The Store package, user data, `~/.codex`, repositories, and remote hosts are untouched.
+This removes only shortcuts owned by this project and `%LOCALAPPDATA%\OpenAI\Codex-Windows-SSH`. The Store package, user data, `~/.codex`, repositories, and remote hosts are untouched.
 
-## Updating for a new Store build
+## When an upstream transport change fails compatibility
 
-Do not remove the SHA-256 guard. Audit the new transport bundle, confirm each patch point is unique, add a version profile for any renamed minified helpers, run the self-test and real SSH regressions, and only then add the new hash. `UPSTREAM-DESIGN.patch` documents the source-level change that should ultimately land upstream.
+Keep the structural guard. Audit the changed transport, update the narrow semantic anchors or binding discovery, run the self-test and real SSH regressions, and then rerun the installer. Do not replace failure with an unconditional patch. `UPSTREAM-DESIGN.patch` documents the source-level change that should ultimately land upstream.
 
 ## Legal and project status
 

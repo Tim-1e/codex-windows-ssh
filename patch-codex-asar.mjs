@@ -16,50 +16,117 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
-const supportedMainBuilds = new Map([
-  [
-    "1b4fa62253cde7fde2c5e8a7f88947c1a675481ae5472f0ef6ff1645aa626712",
-    {
-      version: "26.803.10989.0",
-      codexExecutable: "hC",
-      executableResolver: "n.Vn",
-      processSpawner: "n.Fn",
-      shellMetadata: "IC",
-      sshDestination: "NC",
-      sshOptions: "jC",
-      stderrSanitizer: "MC",
-      timeouts: "CC",
-    },
-  ],
-  [
-    "3148e6792685e112ddeed3bafd72cc0e00f9f543ec07194e6b22da18af5d97e1",
-    {
-      version: "26.820.7780.0",
-      codexExecutable: "SS",
-      executableResolver: "n.Kn",
-      processSpawner: "n.Bn",
-      shellMetadata: "GS",
-      sshDestination: "HS",
-      sshOptions: "BS",
-      stderrSanitizer: "VS",
-      timeouts: "MS",
-    },
-  ],
-]);
-
-const supportedPatchedMainHashes = new Map([
-  [
-    "3dc14b5dcda41a94ef8dba2b570475c5be1d23ea288ce86cd6e170298d578b3c",
-    "26.803.10989.0",
-  ],
-  [
-    "92c962b7cfdf0bc3b80ad76e2f96a4bca8114d9b0fbd97c45ca0df20832837a6",
-    "26.820.7780.0",
-  ],
-]);
-
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const align4 = (value) => (value + 3) & ~3;
+
+function matchExactlyOnce(source, pattern, label) {
+  const matches = [...source.matchAll(pattern)];
+  if (matches.length !== 1) {
+    throw new Error(`Expected exactly one ${label}, found ${matches.length}`);
+  }
+  return matches[0].groups ?? {};
+}
+
+function sectionExactlyOnce(source, start, end, label) {
+  const first = source.indexOf(start);
+  const second = first < 0 ? -1 : source.indexOf(start, first + start.length);
+  const finish = first < 0 ? -1 : source.indexOf(end, first + start.length);
+  if (first < 0 || second >= 0 || finish < 0) {
+    throw new Error(`Expected exactly one ${label} section`);
+  }
+  return source.slice(first, finish);
+}
+
+function discoverMainBindings(source) {
+  const proxy = sectionExactlyOnce(
+    source,
+    "createSshProxyStream(e){",
+    "async runWithSshStartupGate(e){",
+    "SSH proxy",
+  );
+  const login = sectionExactlyOnce(
+    source,
+    "async runRemoteLoginShellCommand(",
+    "createSshProxyStream(e){",
+    "remote login shell",
+  );
+  const reference = "[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*";
+  const capture = (text, pattern, label) =>
+    matchExactlyOnce(text, new RegExp(pattern, "gu"), label);
+
+  const result = {
+    ...capture(
+      proxy,
+      `^createSshProxyStream\\(e\\)\\{let t=(?<codexExecutable>${reference})\\(\\),`,
+      "Codex executable binding",
+    ),
+    ...capture(
+      proxy,
+      `this\\.logger\\.info\\(\\x60ssh_websocket_v0\\.proxy_command_starting\\x60,\\{safe:\\{operation:\\x60app_server_proxy\\x60,\\.\\.\\.(?<shellMetadata>${reference})\\(e\\.shellEnv\\),sshCommandKind:`,
+      "shell metadata binding",
+    ),
+    ...capture(
+      proxy,
+      `let [A-Za-z_$][\\w$]*=(?<spawnFunction>\\(0,${reference}\\))\\((?<executableResolver>${reference})\\.resolve\\(\\x60ssh\\x60\\)\\?\\?\\x60ssh\\x60,\\[\\x60-T\\x60,\\.\\.\\.(?<sshOptions>${reference})\\(this\\.options\\.getConnectTimeoutSeconds\\?\\.\\(\\)\\),\\.\\.\\.(?<sshDestination>${reference})\\(this\\.options\\.sshConnection\\),[\\s\\S]+?\\],\\{env:(?<environmentNormalizer>${reference})\\(process\\.env\\),stdio:\\[\\x60pipe\\x60,\\x60pipe\\x60,\\x60pipe\\x60\\]\\}\\)`,
+      "SSH stream spawn bindings",
+    ),
+    ...capture(
+      proxy,
+      `new (?<duplexConstructor>${reference})\\(\\{read\\(\\)\\{`,
+      "Duplex stream binding",
+    ),
+    ...capture(
+      proxy,
+      `let [A-Za-z_$][\\w$]*=(?<stderrSanitizer>${reference})\\([A-Za-z_$][\\w$]*\\);this\\.logger\\.warning\\(\\x60ssh_websocket_v0\\.proxy_command_failed\\x60`,
+      "stderr sanitizer binding",
+    ),
+    ...capture(
+      login,
+      `async runRemoteLoginShellCommand\\(\\{command:e,context:t,operation:n,timeoutMessage:r,timeoutMs:i=(?<timeouts>${reference})\\.remoteLoginShellCommandMinimum\\}\\)`,
+      "remote command timeout binding",
+    ),
+    ...capture(
+      login,
+      `Math\\.max\\((?<timeoutsAgain>${reference})\\.remoteLoginShellCommandMinimum,\\(c\\?\\?0\\)\\*1e3,a\\),u=(?<processSpawner>${reference})\\(\\{args:\\[\\x60ssh\\x60,\\.\\.\\.(?<sshOptionsAgain>${reference})\\(c\\),\\.\\.\\.(?<sshDestinationAgain>${reference})\\(this\\.options\\.sshConnection\\),`,
+      "remote command spawn bindings",
+    ),
+  };
+
+  for (const [first, second] of [
+    ["timeouts", "timeoutsAgain"],
+    ["sshOptions", "sshOptionsAgain"],
+    ["sshDestination", "sshDestinationAgain"],
+  ]) {
+    if (result[first] !== result[second]) {
+      throw new Error(`Inconsistent ${first} binding in official SSH transport`);
+    }
+    delete result[second];
+  }
+  return result;
+}
+
+function discoverUpdateMenuBindings(source) {
+  const reference = "[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*";
+  const result = matchExactlyOnce(
+    source,
+    new RegExp(
+      `(?<handler>click:\\(\\)=>\\{(?<logger>${reference})\\(\\)\\.info\\(\\x60Check for updates requested via menu\\.\\x60\\),(?<manager>${reference})\\.checkForUpdates\\(\\)\\.then\\(\\(\\)=>\\{if\\((?<managerHas>${reference})\\.hasUpdater\\(\\)\\)return;let e=(?<managerReason>${reference})\\.getUnavailableReason\\(\\)\\?\\?\\x60unknown\\x60;(?<loggerWarn>${reference})\\(\\)\\.warning\\(\\x60Desktop updater unavailable; init likely skipped\\.\\x60,\\{safe:\\{reason:e\\},sensitive:\\{\\}\\}\\),(?<electron>${reference})\\.dialog\\.showMessageBox\\(\\{type:\\x60info\\x60,title:\\x60Updates Unavailable\\x60,message:\\x60Automatic updates are unavailable right now\\.\\x60,detail:\\x60Updater initialization skipped: \\$\\{e\\}\\x60\\}\\)\\}\\)\\})`,
+      "gu",
+    ),
+    "desktop update menu handler",
+  );
+  if (
+    result.manager !== result.managerHas ||
+    result.manager !== result.managerReason ||
+    result.logger !== result.loggerWarn
+  ) {
+    throw new Error("Inconsistent bindings in desktop update menu handler");
+  }
+  delete result.managerHas;
+  delete result.managerReason;
+  delete result.loggerWarn;
+  return result;
+}
 
 function readExact(fd, size, position) {
   const value = Buffer.alloc(size);
@@ -269,13 +336,9 @@ function rewriteArchive(inputPath, outputPath, replacements) {
 
 function patchMainBundle(source, controllerScript) {
   const inputHash = hash(source);
-  const build = supportedMainBuilds.get(inputHash);
-  if (!build) {
-    throw new Error(
-      `Unsupported Codex Desktop main bundle SHA-256: ${inputHash}`,
-    );
-  }
   let patched = source.toString("utf8");
+  const build = discoverMainBindings(patched);
+  const updateMenu = discoverUpdateMenuBindings(patched);
   const replaceOnce = (needle, replacement, label) => {
     const first = patched.indexOf(needle);
     if (first < 0 || patched.indexOf(needle, first + needle.length) >= 0) {
@@ -283,6 +346,22 @@ function patchMainBundle(source, controllerScript) {
     }
     patched = `${patched.slice(0, first)}${replacement}${patched.slice(first + needle.length)}`;
   };
+
+  const updaterSuffix =
+    "\\OpenAI\\Codex-Windows-SSH\\updater\\Update-Codex-Windows-SSH.ps1";
+  const updateClickHandler = [
+    "click:()=>{",
+    `${updateMenu.logger}().info(\x60Check for updates requested via Codex Windows SSH.\x60);`,
+    "let e=process.env.LOCALAPPDATA;",
+    `if(!e){${updateMenu.electron}.dialog.showMessageBox({type:\x60error\x60,title:\x60Update Check Failed\x60,message:\x60LOCALAPPDATA is unavailable; the patched updater could not be located.\x60});return}`,
+    `let t=e+${JSON.stringify(updaterSuffix)},n=${build.spawnFunction}(\x60pwsh.exe\x60,[\x60-NoLogo\x60,\x60-NoProfile\x60,\x60-NonInteractive\x60,\x60-File\x60,t,\x60-Menu\x60],{detached:!0,stdio:\x60ignore\x60,windowsHide:!0});`,
+    `n.once(\x60error\x60,e=>{${updateMenu.logger}().warning(\x60Failed to start Codex Windows SSH updater.\x60,{safe:{},sensitive:{error:e}}),${updateMenu.electron}.dialog.showMessageBox({type:\x60error\x60,title:\x60Update Check Failed\x60,message:\x60Could not start the Codex Windows SSH updater.\x60,detail:e instanceof Error?e.message:String(e)})}),n.unref()}`,
+  ].join("");
+  replaceOnce(
+    updateMenu.handler,
+    updateClickHandler,
+    "desktop update menu handler",
+  );
 
   replaceOnce(
     "proxyStreams=new Set;hasConnected=!1;installedCodexVersion;constructor",
@@ -329,8 +408,8 @@ function patchMainBundle(source, controllerScript) {
   const proxyMethod = [
     "createWindowsSshProxyStream(e){let t=this.windowsSshPort;if(t==null)throw Error(`Windows SSH app-server port is unavailable`);",
     `this.logger.info(\`ssh_websocket_v0.windows_proxy_command_starting\`,{safe:{operation:\`app_server_proxy\`,port:t,...${build.shellMetadata}(e.shellEnv),sshCommandKind:\`ssh_direct_tcpip\`,sshPhase:e.phase},sensitive:{sshAlias:this.options.sshConnection.alias,sshHost:this.options.sshConnection.host,sshPort:this.options.sshConnection.port}});`,
-    `let r=(0,x.spawn)(${build.executableResolver}.resolve(\`ssh\`)??\`ssh\`,[\`-T\`,...${build.sshOptions}(this.options.getConnectTimeoutSeconds?.()),\`-W\`,\`127.0.0.1:${"${t}"}\`,...${build.sshDestination}(this.options.sshConnection)],{env:i.t(process.env),stdio:[\`pipe\`,\`pipe\`,\`pipe\`],windowsHide:!0}),{stdin:a,stdout:o,stderr:s}=r;if(a==null||o==null||s==null)throw r.kill(),Error(\`ssh direct-tcpip stdio was unavailable\`);`,
-    "let c=``;s.on(`data`,e=>{c=`${c}${e.toString(`utf8`)}`.slice(-4e3)});let l=new E.Duplex({read(){o.resume()},write(e,t,n){a.write(e,t,n)},final(e){a.end(),e()},destroy(e,t){r.kill(),t(e)}});Object.assign(l,{setKeepAlive:()=>l,setNoDelay:()=>l,setTimeout:()=>l});",
+    `let r=${build.spawnFunction}(${build.executableResolver}.resolve(\`ssh\`)??\`ssh\`,[\`-T\`,...${build.sshOptions}(this.options.getConnectTimeoutSeconds?.()),\`-W\`,\`127.0.0.1:${"${t}"}\`,...${build.sshDestination}(this.options.sshConnection)],{env:${build.environmentNormalizer}(process.env),stdio:[\`pipe\`,\`pipe\`,\`pipe\`],windowsHide:!0}),{stdin:a,stdout:o,stderr:s}=r;if(a==null||o==null||s==null)throw r.kill(),Error(\`ssh direct-tcpip stdio was unavailable\`);`,
+    `let c=\`\`;s.on(\`data\`,e=>{c=\`${"${c}${e.toString(`utf8`)}"}\`.slice(-4e3)});let l=new ${build.duplexConstructor}({read(){o.resume()},write(e,t,n){a.write(e,t,n)},final(e){a.end(),e()},destroy(e,t){r.kill(),t(e)}});Object.assign(l,{setKeepAlive:()=>l,setNoDelay:()=>l,setTimeout:()=>l});`,
     "let u=e=>{l.destroy(e)};a.on(`error`,u),o.on(`error`,u),this.proxyStreams.add(l),l.once(`close`,()=>{this.proxyStreams.delete(l)}),o.on(`data`,e=>{e.length!==0&&(l.push(e)||o.pause())}),o.on(`end`,()=>{l.push(null)}),r.on(`error`,e=>{l.destroy(e)}),",
     `r.on(\`close\`,(t,n)=>{if(a.removeListener(\`error\`,u),o.removeListener(\`error\`,u),t===0){l.push(null);return}let r=${build.stderrSanitizer}(c);this.logger.warning(\`ssh_websocket_v0.windows_proxy_command_failed\`,{safe:{code:t,operation:\`app_server_proxy\`,...${build.shellMetadata}(e.shellEnv),signal:n,sshCommandKind:\`ssh_direct_tcpip\`,sshPhase:e.phase},sensitive:{sshAlias:this.options.sshConnection.alias,sshHost:this.options.sshConnection.host,sshPort:this.options.sshConnection.port,stderr:c}}),l.destroy(Error(\`ssh -W exited with code ${"${t}"}, signal ${"${n}"}: ${"${r}"}\`))}),queueMicrotask(()=>{l.emit(\`connect\`)});return l}`,
   ].join("");
@@ -346,7 +425,7 @@ function patchMainBundle(source, controllerScript) {
     inputHash,
     output,
     outputHash: hash(output),
-    packageVersion: build.version,
+    compatibility: "structural",
   };
 }
 
@@ -356,10 +435,6 @@ function verifyArchive(archivePath) {
     const main = findMainEntry(parsed);
     const source = readExact(parsed.fd, main.size, parsed.dataOffset + main.offset);
     const mainHash = hash(source);
-    const packageVersion = supportedPatchedMainHashes.get(mainHash);
-    if (!packageVersion) {
-      throw new Error(`Unsupported patched main bundle SHA-256: ${mainHash}`);
-    }
     for (const token of [
       "CODEX_WINDOWS_CONTROLLER_V1",
       "CODEX_WINDOWS_ENDPOINT_V1",
@@ -367,15 +442,31 @@ function verifyArchive(archivePath) {
       "ssh_direct_tcpip",
       "collectOutput:!1",
       "toString(`utf8`)",
+      "Check for updates requested via Codex Windows SSH.",
+      "Update-Codex-Windows-SSH.ps1",
+      "windowsHide:!0",
     ]) {
       if (!source.includes(token)) {
         throw new Error(`Patched main bundle is missing: ${token}`);
       }
     }
     for (const token of [
+      "windowsSshDetected=!1;windowsSshPort;windowsController;constructor",
+      "disposeWindowsController(){",
+      "async tryEnsureWindowsRemoteAppServer(e){",
+      "createWindowsSshProxyStream(e){",
+      "if(this.windowsSshPort!=null)return this.createWindowsSshProxyStream(e);",
+    ]) {
+      const first = source.indexOf(token);
+      if (first < 0 || source.indexOf(token, first + token.length) >= 0) {
+        throw new Error(`Expected exactly one patched structure: ${token}`);
+      }
+    }
+    for (const token of [
       "CODEX_WINDOWS_SSH_HOSTS",
       "codex-app-server-ws.ps1",
       "windows_app_server_manager",
+      "Automatic updates are unavailable right now.",
     ]) {
       if (source.includes(token)) {
         throw new Error(`Patched main bundle contains a legacy token: ${token}`);
@@ -400,7 +491,7 @@ function verifyArchive(archivePath) {
     return {
       ok: true,
       verified: true,
-      packageVersion,
+      compatibility: "structural",
       mainEntryPath: main.path,
       mainSha256: mainHash,
       archivePath: resolve(archivePath),
@@ -442,7 +533,7 @@ function patchArchive(inputPath, outputPath, checkOnly = false) {
   return {
     ok: true,
     checkOnly,
-    packageVersion: result.packageVersion,
+    compatibility: result.compatibility,
     mainEntryPath: main.path,
     inputMainSha256: result.inputHash,
     outputMainSha256: result.outputHash,
@@ -451,19 +542,62 @@ function patchArchive(inputPath, outputPath, checkOnly = false) {
   };
 }
 
+function makeSyntheticMain(bindings) {
+  return Buffer.from(
+    [
+      "class SyntheticTransport{",
+      "proxyStreams=new Set;hasConnected=!1;installedCodexVersion;constructor(){}",
+      "dispose(){for(let e of this.proxyStreams)e.destroy();this.proxyStreams.clear()}",
+      "async connect(t){if(this.hasConnected)try{return await this.connectToRemoteAppServer(t)}catch(e){}return this.installedCodexVersion=void 0,await this.ensureRemoteAppServer(t),this.connectToRemoteAppServer(t)}",
+      "async ensureRemoteAppServer(e){}",
+      "async killCodexProcess(){let{code:e,stdout:t,stderr:r}=await this.runRemoteLoginShellCommand({});return e+t+r}",
+      `async runRemoteLoginShellCommand({command:e,context:t,operation:n,timeoutMessage:r,timeoutMs:i=${bindings.timeouts}.remoteLoginShellCommandMinimum}){return this.runRemoteLoginShellCommandWithoutGate({command:e,context:t,operation:n,timeoutMessage:r,timeoutMs:i})}`,
+      `async runRemoteLoginShellCommandWithoutGate({command:e,context:t,operation:r,timeoutMessage:i,timeoutMs:a=${bindings.timeouts}.remoteLoginShellCommandMinimum}){let c=this.options.getConnectTimeoutSeconds?.(),l=Math.max(${bindings.timeouts}.remoteLoginShellCommandMinimum,(c??0)*1e3,a),u=${bindings.processSpawner}({args:[\`ssh\`,...${bindings.sshOptions}(c),...${bindings.sshDestination}(this.options.sshConnection),e],spawnInsideWsl:!1});return u}`,
+      `createSshProxyStream(e){let t=${bindings.codexExecutable}(),r=\`proxy\`,i=0;this.logger.info(\`ssh_websocket_v0.proxy_command_starting\`,{safe:{operation:\`app_server_proxy\`,...${bindings.shellMetadata}(e.shellEnv),sshCommandKind:\`app_server_proxy\`}});let a=${bindings.spawnFunction}(${bindings.executableResolver}.resolve(\`ssh\`)??\`ssh\`,[\`-T\`,...${bindings.sshOptions}(this.options.getConnectTimeoutSeconds?.()),...${bindings.sshDestination}(this.options.sshConnection),r],{env:${bindings.environmentNormalizer}(process.env),stdio:[\`pipe\`,\`pipe\`,\`pipe\`]}),{stdin:o,stdout:s,stderr:c}=a,l=\`\`,u=new ${bindings.duplexConstructor}({read(){s.resume()}});a.on(\`close\`,()=>{let r=${bindings.stderrSanitizer}(l);this.logger.warning(\`ssh_websocket_v0.proxy_command_failed\`,{})});return u}`,
+      "async runWithSshStartupGate(e){return e()}",
+      "}",
+      `const SyntheticUpdateMenu={click:()=>{${bindings.updateLogger}().info(\`Check for updates requested via menu.\`),${bindings.updateManager}.checkForUpdates().then(()=>{if(${bindings.updateManager}.hasUpdater())return;let e=${bindings.updateManager}.getUnavailableReason()??\`unknown\`;${bindings.updateLogger}().warning(\`Desktop updater unavailable; init likely skipped.\`,{safe:{reason:e},sensitive:{}}),${bindings.electron}.dialog.showMessageBox({type:\`info\`,title:\`Updates Unavailable\`,message:\`Automatic updates are unavailable right now.\`,detail:\`Updater initialization skipped: ${"${e}"}\`})})}};`,
+    ].join(""),
+    "utf8",
+  );
+}
+
 function selfTest() {
   const root = mkdtempSync(join(tmpdir(), "codex-asar-self-test-"));
   const input = join(root, "input.asar");
   const output = join(root, "output.asar");
   try {
-    const first = Buffer.from("first", "utf8");
+    const first = makeSyntheticMain({
+      codexExecutable: "SS",
+      duplexConstructor: "E.Duplex",
+      environmentNormalizer: "i.t",
+      executableResolver: "n.Kn",
+      processSpawner: "n.Bn",
+      shellMetadata: "GS",
+      spawnFunction: "(0,x.spawn)",
+      sshDestination: "HS",
+      sshOptions: "BS",
+      stderrSanitizer: "VS",
+      timeouts: "MS",
+      updateLogger: "UL",
+      updateManager: "UM",
+      electron: "EL",
+    });
     const second = Buffer.from([0, 1, 2, 3]);
     const header = {
       files: {
-        "first.txt": {
-          size: first.length,
-          offset: "0",
-          integrity: makeIntegrity(first),
+        ".vite": {
+          files: {
+            build: {
+              files: {
+                "main-test.js": {
+                  size: first.length,
+                  offset: "0",
+                  integrity: makeIntegrity(first),
+                },
+              },
+            },
+          },
         },
         nested: {
           files: {
@@ -487,12 +621,12 @@ function selfTest() {
     } finally {
       closeSync(fd);
     }
-    const replacement = Buffer.from("first-expanded", "utf8");
-    rewriteArchive(input, output, new Map([["first.txt", replacement]]));
+    patchArchive(input, output);
+    verifyArchive(output);
     const parsed = parseArchive(output);
     try {
       const byPath = new Map(parsed.entries.map((item) => [item.path, item]));
-      const firstEntry = byPath.get("first.txt");
+      const firstEntry = byPath.get(".vite/build/main-test.js");
       const secondEntry = byPath.get("nested/second.bin");
       const firstValue = readExact(
         parsed.fd,
@@ -504,16 +638,68 @@ function selfTest() {
         secondEntry.size,
         parsed.dataOffset + secondEntry.offset,
       );
-      if (!firstValue.equals(replacement) || !secondValue.equals(second)) {
+      if (
+        !firstValue.includes("createWindowsSshProxyStream") ||
+        !firstValue.includes("Update-Codex-Windows-SSH.ps1") ||
+        firstValue.includes("Automatic updates are unavailable right now.") ||
+        !secondValue.equals(second)
+      ) {
         throw new Error("ASAR self-test content mismatch");
       }
-      if (firstEntry.entry.integrity.hash !== hash(replacement)) {
+      if (firstEntry.entry.integrity.hash !== hash(firstValue)) {
         throw new Error("ASAR self-test integrity mismatch");
       }
     } finally {
       closeSync(parsed.fd);
     }
-    return { ok: true, selfTest: true };
+
+    const renamed = makeSyntheticMain({
+      codexExecutable: "HC",
+      duplexConstructor: "E.Duplex",
+      environmentNormalizer: "n.hi",
+      executableResolver: "n.Gn",
+      processSpawner: "n.zn",
+      shellMetadata: "dw",
+      spawnFunction: "(0,x.spawn)",
+      sshDestination: "cw",
+      sshOptions: "ow",
+      stderrSanitizer: "sw",
+      timeouts: "QC",
+      updateLogger: "uL",
+      updateManager: "uM",
+      electron: "eL",
+    });
+    const renamedResult = patchMainBundle(renamed, "Write-Output test");
+    if (!renamedResult.output.includes("env:n.hi(process.env)")) {
+      throw new Error("Renamed binding self-test failed");
+    }
+
+    let rejectedChangedStructure = false;
+    try {
+      patchMainBundle(
+        Buffer.from(
+          renamed
+            .toString("utf8")
+            .replace(
+              "dispose(){for(let e of this.proxyStreams)e.destroy();this.proxyStreams.clear()}",
+              "dispose(){}",
+            ),
+          "utf8",
+        ),
+        "Write-Output test",
+      );
+    } catch (error) {
+      rejectedChangedStructure = /dispose lifecycle/u.test(error.message);
+    }
+    if (!rejectedChangedStructure) {
+      throw new Error("Changed structure did not fail closed");
+    }
+    return {
+      ok: true,
+      selfTest: true,
+      structuralCompatibility: true,
+      changedStructureFailsClosed: true,
+    };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

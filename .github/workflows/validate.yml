@@ -1,0 +1,87 @@
+name: Validate patch and updater
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate structural patcher
+        run: npm test
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in Get-ChildItem -LiteralPath . -Filter '*.ps1') {
+            $tokens = $null
+            $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile(
+              $file.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              $errors | ForEach-Object { Write-Error "$($file.Name): $($_.Message)" }
+            }
+          }
+          if ($failed) { throw 'PowerShell syntax validation failed.' }
+      - name: Parse launcher
+        shell: pwsh
+        run: |
+          $env:CODEX_WINDOWS_SSH_LAUNCHER_VALIDATE = '1'
+          & "$env:SystemRoot\System32\cscript.exe" //nologo .\Start-Codex.vbs
+          if ($LASTEXITCODE -ne 0) { throw "Launcher validation failed: $LASTEXITCODE" }
+      - name: Compile stable taskbar launcher
+        shell: pwsh
+        run: |
+          $compiler = @(
+            (Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
+            (Join-Path $env:SystemRoot 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $compiler) { throw 'Windows .NET Framework compiler not found.' }
+          & $compiler /nologo /target:winexe /optimize+ /reference:System.dll /reference:System.Windows.Forms.dll /out:CodexLauncher.exe .\CodexLauncher.cs
+          if ($LASTEXITCODE -ne 0) { throw "Launcher compilation failed: $LASTEXITCODE" }
+          & $compiler /nologo /target:exe /optimize+ /reference:System.dll /reference:System.Web.Extensions.dll /out:ElectronAsarIntegrity.exe .\ElectronAsarIntegrity.cs
+          if ($LASTEXITCODE -ne 0) { throw "ASAR integrity tool compilation failed: $LASTEXITCODE" }
+          & .\ElectronAsarIntegrity.exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw "ASAR integrity tool self-test failed: $LASTEXITCODE" }
+      - name: Resolve stable and version-local launchers
+        shell: pwsh
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP ("codex-launcher-" + [guid]::NewGuid().ToString('N'))
+          $runtimeId = '26.901.1978.0-r3'
+          $app = Join-Path $fixture "$runtimeId\app\ChatGPT.exe"
+          New-Item -ItemType Directory -Path (Split-Path -Parent $app) -Force | Out-Null
+          [IO.File]::WriteAllBytes($app, [byte[]]@())
+          [IO.File]::WriteAllText(
+            (Join-Path $fixture 'current.version'),
+            "$runtimeId`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          Copy-Item -LiteralPath .\Start-Codex.vbs -Destination (Join-Path $fixture 'Start-Codex.vbs')
+          Copy-Item -LiteralPath .\Start-Codex.vbs -Destination (Join-Path $fixture "$runtimeId\Start-Codex.vbs")
+          $env:CODEX_WINDOWS_SSH_LAUNCHER_VALIDATE = 'resolve'
+          foreach ($launcher in @(
+            (Join-Path $fixture 'Start-Codex.vbs'),
+            (Join-Path $fixture "$runtimeId\Start-Codex.vbs")
+          )) {
+            $output = @(& "$env:SystemRoot\System32\cscript.exe" //nologo $launcher)
+            if ($LASTEXITCODE -ne 0 -or $output -notcontains "appPath=$app") {
+              throw "Launcher resolution failed: $launcher`n$($output -join [Environment]::NewLine)"
+            }
+          }
+          Copy-Item -LiteralPath .\CodexLauncher.exe -Destination (Join-Path $fixture 'CodexLauncher.exe')
+          $process = Start-Process -FilePath (Join-Path $fixture 'CodexLauncher.exe') -ArgumentList '--validate' -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) {
+            throw "Stable taskbar launcher validation failed: $($process.ExitCode)"
+          }

@@ -7,6 +7,21 @@ $ErrorActionPreference = 'Stop'
 $installRoot = Join-Path (Join-Path $env:LOCALAPPDATA 'OpenAI') 'Codex-Windows-SSH'
 $expectedRoot = [IO.Path]::GetFullPath($installRoot).TrimEnd('\')
 
+function Test-OwnedShortcut {
+    param([Parameter(Mandatory)]$Shortcut)
+
+    if ($Shortcut.Arguments.IndexOf($expectedRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        return $true
+    }
+    if ([string]::IsNullOrWhiteSpace($Shortcut.TargetPath)) { return $false }
+    try {
+        $target = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($Shortcut.TargetPath))
+        return $target.StartsWith($expectedRoot + '\', [StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $false
+    }
+}
+
 $running = @(Get-CimInstance Win32_Process | Where-Object {
     $_.ExecutablePath -and
     [IO.Path]::GetFullPath($_.ExecutablePath).StartsWith($expectedRoot + '\', [StringComparison]::OrdinalIgnoreCase)
@@ -18,11 +33,23 @@ if ($running.Count -gt 0) {
 $shortcutShell = New-Object -ComObject WScript.Shell
 foreach ($directory in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) {
     if ([string]::IsNullOrWhiteSpace($directory)) { continue }
-    $shortcutPath = Join-Path $directory 'Codex.lnk'
-    if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) { continue }
-    $shortcut = $shortcutShell.CreateShortcut($shortcutPath)
-    if ($shortcut.Arguments.IndexOf($expectedRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-        Remove-Item -LiteralPath $shortcutPath -Force
+    foreach ($name in @('Codex.lnk', 'ChatGPT.lnk')) {
+        $shortcutPath = Join-Path $directory $name
+        if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) { continue }
+        $shortcut = $shortcutShell.CreateShortcut($shortcutPath)
+        if (Test-OwnedShortcut -Shortcut $shortcut) {
+            Remove-Item -LiteralPath $shortcutPath -Force
+        }
+    }
+}
+
+$taskbarDirectory = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
+if (Test-Path -LiteralPath $taskbarDirectory -PathType Container) {
+    foreach ($shortcutPath in Get-ChildItem -LiteralPath $taskbarDirectory -Filter '*.lnk' -File) {
+        $shortcut = $shortcutShell.CreateShortcut($shortcutPath.FullName)
+        if (Test-OwnedShortcut -Shortcut $shortcut) {
+            Remove-Item -LiteralPath $shortcutPath.FullName -Force
+        }
     }
 }
 
