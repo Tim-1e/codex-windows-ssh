@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "check": "node --check patch-codex-asar.mjs",
-    "test": "node patch-codex-asar.mjs --self-test"
+    "test": "node patch-codex-asar.mjs --self-test && node test-desktop-updater.cjs"
   },
   "license": "MIT"
 }

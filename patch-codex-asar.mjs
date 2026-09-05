@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { runInNewContext } from "node:vm";
+import { patchUpdateCard, patchUpdateViewState, UPDATE_CARD_MARKER } from './patch-update-card.mjs';
 
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const align4 = (value) => (value + 3) & ~3;
@@ -356,15 +357,11 @@ function patchMainBundle(source, controllerScript) {
     patched = `${patched.slice(0, first)}${replacement}${patched.slice(first + needle.length)}`;
   };
 
-  const updaterSuffix =
-    "\\OpenAI\\Codex-Windows-SSH\\updater\\Update-Codex-Windows-SSH.ps1";
   const updateClickHandler = [
     "click:()=>{",
     `${updateMenu.logger}().info(\x60Check for updates requested via Codex Windows SSH.\x60);`,
-    "let e=process.env.LOCALAPPDATA;",
-    `if(!e){${updateMenu.electron}.dialog.showMessageBox({type:\x60error\x60,title:\x60Update Check Failed\x60,message:\x60LOCALAPPDATA is unavailable; the patched updater could not be located.\x60});return}`,
-    `let t=e+${JSON.stringify(updaterSuffix)},n=${build.spawnFunction}(\x60pwsh.exe\x60,[\x60-NoLogo\x60,\x60-NoProfile\x60,\x60-NonInteractive\x60,\x60-File\x60,t,\x60-Menu\x60],{detached:!0,stdio:\x60ignore\x60,windowsHide:!0});`,
-    `n.once(\x60error\x60,e=>{${updateMenu.logger}().warning(\x60Failed to start Codex Windows SSH updater.\x60,{safe:{},sensitive:{error:e}}),${updateMenu.electron}.dialog.showMessageBox({type:\x60error\x60,title:\x60Update Check Failed\x60,message:\x60Could not start the Codex Windows SSH updater.\x60,detail:e instanceof Error?e.message:String(e)})}),n.unref()}`,
+    `try{require(require('node:path').join(process.resourcesPath,'desktop-updater.cjs')).check(${updateMenu.manager})}`,
+    `catch(error){${updateMenu.electron}.dialog.showMessageBox({type:'error',message:'检查更新失败',detail:String(error.message||error)})}}`,
   ].join("");
   replaceOnce(
     updateMenu.handler,
@@ -459,6 +456,32 @@ function patchBootstrapBundle(source) {
   return output;
 }
 
+function patchUpdaterBundle(source) {
+  const text = source.toString('utf8');
+  const section = sectionExactlyOnce(text, 'async initializeWindowsUpdater(){', 'initializeLinuxPackageUpdater(){', 'Windows updater initialization');
+  const replacement = "async initializeWindowsUpdater(){/* codex-windows-ssh: official update UI */require(require('node:path').join(process.resourcesPath,'desktop-updater.cjs')).install(this)}";
+  for (const method of ['setUpdateLifecycleState(', 'setDownloadProgressPercent(', 'setInstallProgressPercent(', 'setUpdateReady(']) {
+    if (!text.includes(method)) throw new Error(`Official updater interface changed: ${method}`);
+  }
+  const output = Buffer.from(text.replace(section, () => replacement));
+  assertNodeSyntax(output, 'Patched updater bundle');
+  return output;
+}
+
+function findUpdaterEntry(parsed) {
+  const matches = parsed.entries.filter(item => item.path.startsWith('.vite/build/') && item.path.endsWith('.js') &&
+    readExact(parsed.fd, item.size, parsed.dataOffset + item.offset).includes('async initializeWindowsUpdater(){'));
+  if (matches.length !== 1) throw new Error(`Expected one official updater implementation, found ${matches.length}`);
+  return matches[0];
+}
+
+function findUpdateCardEntry(parsed) {
+  const matches = parsed.entries.filter(item => item.path.startsWith('webview/assets/') && item.path.endsWith('.js') &&
+    readExact(parsed.fd, item.size, parsed.dataOffset + item.offset).includes('id:`appUpdate.installProgress.progressLabel`'));
+  if (matches.length !== 1) throw new Error(`Expected one official update card bundle, found ${matches.length}`);
+  return matches[0];
+}
+
 function verifyArchive(archivePath) {
   const parsed = parseArchive(archivePath);
   try {
@@ -473,9 +496,10 @@ function verifyArchive(archivePath) {
       "collectOutput:!1",
       "toString(`utf8`)",
       "Check for updates requested via Codex Windows SSH.",
-      "Update-Codex-Windows-SSH.ps1",
+      "desktop-updater.cjs",
       "windowsHide:!0",
       "codex-windows-ssh: unsigned tray",
+      "codexFixUpdate:this.options.sparkleManager.codexFixUpdate",
     ]) {
       if (!source.includes(token)) {
         throw new Error(`Patched main bundle is missing: ${token}`);
@@ -529,6 +553,21 @@ function verifyArchive(archivePath) {
       throw new Error('Patched bootstrap identity or integrity is invalid');
     }
     assertNodeSyntax(bootstrapSource, 'Verified bootstrap bundle');
+    const updater = findUpdaterEntry(parsed);
+    const updaterSource = readExact(parsed.fd, updater.size, parsed.dataOffset + updater.offset);
+    if (!updaterSource.includes('codex-windows-ssh: official update UI') ||
+        JSON.stringify(makeIntegrity(updaterSource, updater.entry.integrity?.blockSize)) !== JSON.stringify(updater.entry.integrity)) {
+      throw new Error('Patched updater interface or integrity is invalid');
+    }
+    assertNodeSyntax(updaterSource, 'Verified updater bundle');
+    const card = findUpdateCardEntry(parsed);
+    const cardSource = readExact(parsed.fd, card.size, parsed.dataOffset + card.offset);
+    if (!cardSource.includes(UPDATE_CARD_MARKER) ||
+        JSON.stringify(makeIntegrity(cardSource, card.entry.integrity?.blockSize)) !== JSON.stringify(card.entry.integrity)) {
+      throw new Error('Patched update card or integrity is invalid');
+    }
+    const cardSyntax = spawnSync(process.execPath, ['--check', '--input-type=module'], { input: cardSource, windowsHide: true });
+    if (cardSyntax.status !== 0) throw new Error('Verified update card syntax is invalid');
     return {
       ok: true,
       verified: true,
@@ -559,6 +598,10 @@ function patchArchive(inputPath, outputPath, checkOnly = false) {
   let main;
   let bootstrap;
   let bootstrapOutput;
+  let updater;
+  let updaterOutput;
+  let card;
+  let cardOutput;
   try {
     main = findMainEntry(parsed);
     const source = readExact(parsed.fd, main.size, parsed.dataOffset + main.offset);
@@ -567,13 +610,19 @@ function patchArchive(inputPath, outputPath, checkOnly = false) {
       "utf8",
     ).replace(/\r\n/gu, "\n");
     result = patchMainBundle(source, controllerScript);
+    result.output = patchUpdateViewState(result.output);
+    result.outputHash = hash(result.output);
     bootstrap = findMainEntry(parsed, 'bootstrap');
     bootstrapOutput = patchBootstrapBundle(readExact(parsed.fd, bootstrap.size, parsed.dataOffset + bootstrap.offset));
+    updater = findUpdaterEntry(parsed);
+    updaterOutput = patchUpdaterBundle(readExact(parsed.fd, updater.size, parsed.dataOffset + updater.offset));
+    card = findUpdateCardEntry(parsed);
+    cardOutput = patchUpdateCard(readExact(parsed.fd, card.size, parsed.dataOffset + card.offset));
   } finally {
     closeSync(parsed.fd);
   }
   if (!checkOnly) {
-    rewriteArchive(inputPath, outputPath, new Map([[main.path, result.output], [bootstrap.path, bootstrapOutput]]));
+    rewriteArchive(inputPath, outputPath, new Map([[main.path, result.output], [bootstrap.path, bootstrapOutput], [updater.path, updaterOutput], [card.path, cardOutput]]));
   }
   return {
     ok: true,
@@ -602,19 +651,21 @@ function makeSyntheticMain(bindings) {
       `createSshProxyStream(e){let t=${bindings.codexExecutable}(),r=\`proxy\`,i=0;this.logger.info(\`ssh_websocket_v0.proxy_command_starting\`,{safe:{operation:\`app_server_proxy\`,...${bindings.shellMetadata}(e.shellEnv),sshCommandKind:\`app_server_proxy\`}});let a=${bindings.spawnFunction}(${bindings.executableResolver}.resolve(\`ssh\`)??\`ssh\`,[\`-T\`,...${bindings.sshOptions}(this.options.getConnectTimeoutSeconds?.()),...${bindings.sshDestination}(this.options.sshConnection),r],{env:${bindings.environmentNormalizer}(process.env),stdio:[\`pipe\`,\`pipe\`,\`pipe\`]}),{stdin:o,stdout:s,stderr:c}=a,l=\`\`,u=new ${bindings.duplexConstructor}({read(){s.resume()}});a.on(\`close\`,()=>{let r=${bindings.stderrSanitizer}(l);this.logger.warning(\`ssh_websocket_v0.proxy_command_failed\`,{})});return u}`,
       "async runWithSshStartupGate(e){return e()}",
       "}",
-      `const SyntheticUpdateMenu={click:()=>{${bindings.updateLogger}().info(\`Check for updates requested via menu.\`),${bindings.updateManager}.checkForUpdates().then(()=>{if(${bindings.updateManager}.hasUpdater())return;let e=${bindings.updateManager}.getUnavailableReason()??\`unknown\`;${bindings.updateLogger}().warning(\`Desktop updater unavailable; init likely skipped.\`,{safe:{reason:e},sensitive:{}}),${bindings.electron}.dialog.showMessageBox({type:\`info\`,title:\`Updates Unavailable\`,message:\`Automatic updates are unavailable right now.\`,detail:\`Updater initialization skipped: ${"${e}"}\`})})}};`,
+      `const SyntheticUpdateMenu=((x)=>({click:()=>{${bindings.updateLogger}().info(\`Check for updates requested via menu.\`),${bindings.updateManager}.checkForUpdates().then(()=>{if(${bindings.updateManager}.hasUpdater())return;let e=${bindings.updateManager}.getUnavailableReason()??\`unknown\`;${bindings.updateLogger}().warning(\`Desktop updater unavailable; init likely skipped.\`,{safe:{reason:e},sensitive:{}}),${bindings.electron}.dialog.showMessageBox({type:\`info\`,title:\`Updates Unavailable\`,message:\`Automatic updates are unavailable right now.\`,detail:\`Updater initialization skipped: ${"${e}"}\`})})}}))({formatMessage(){}});`,
       `function SyntheticTray(n,t){return new ${bindings.electron}.Tray(n.defaultIcon,process.platform===\`win32\`&&${bindings.electron}.app.isPackaged?trayGuid(t):void 0)}`,
     ].join(""),
     "utf8",
   );
 }
 
-function selfTest() {
+async function selfTest() {
+  const { fixture, selfTestUpdateCard } = await import('./test-update-card.mjs');
+  selfTestUpdateCard();
   const root = mkdtempSync(join(tmpdir(), "codex-asar-self-test-"));
   const input = join(root, "input.asar");
   const output = join(root, "output.asar");
   try {
-    const first = makeSyntheticMain({
+    const first = Buffer.concat([makeSyntheticMain({
       codexExecutable: "SS",
       duplexConstructor: "E.Duplex",
       environmentNormalizer: "i.t",
@@ -629,8 +680,10 @@ function selfTest() {
       updateLogger: "UL",
       updateManager: "UM",
       electron: "EL",
-    });
+    }), Buffer.from('class SyntheticViewState{getAppUpdateViewState(){return{downloadProgressPercent:this.options.sparkleManager.getDownloadProgressPercent(),installProgressPercent:this.options.sparkleManager.getInstallProgressPercent(),isUpdateReady:this.options.sparkleManager.getIsUpdateReady(),lifecycleState:this.options.sparkleManager.getUpdateLifecycleState(),relaunchNotice:this.options.sparkleManager.getRelaunchNotice()}}}')]);
     const bootstrap = Buffer.from('process.platform===`win32`&&EL.app.setAppUserModelId(ID.get(flavor));');
+    const updater = Buffer.from('class Updater{async initializeWindowsUpdater(){this.setUpdateReady(false);this.setUpdateLifecycleState("idle");this.setDownloadProgressPercent(null);this.setInstallProgressPercent(null)}initializeLinuxPackageUpdater(){}}');
+    const card = Buffer.from(fixture);
     const second = Buffer.from([0, 1, 2, 3]);
     const header = {
       files: {
@@ -648,15 +701,23 @@ function selfTest() {
                   offset: String(first.length),
                   integrity: makeIntegrity(bootstrap),
                 },
+                'updater-test.js': {
+                  size: updater.length,
+                  offset: String(first.length + bootstrap.length),
+                  integrity: makeIntegrity(updater),
+                },
               },
             },
           },
         },
+        webview: { files: { assets: { files: { 'app-test.js': {
+          size: card.length, offset: String(first.length + bootstrap.length + updater.length), integrity: makeIntegrity(card),
+        } } } } },
         nested: {
           files: {
             "second.bin": {
               size: second.length,
-              offset: String(first.length + bootstrap.length),
+              offset: String(first.length + bootstrap.length + updater.length + card.length),
               integrity: makeIntegrity(second),
             },
           },
@@ -667,7 +728,7 @@ function selfTest() {
     const fd = openSync(input, "wx");
     try {
       let position = 0;
-      for (const value of [sizePickle, headerPickle, first, bootstrap, second]) {
+      for (const value of [sizePickle, headerPickle, first, bootstrap, updater, card, second]) {
         writeExact(fd, value, position);
         position += value.length;
       }
@@ -693,7 +754,7 @@ function selfTest() {
       );
       if (
         !firstValue.includes("createWindowsSshProxyStream") ||
-        !firstValue.includes("Update-Codex-Windows-SSH.ps1") ||
+        !firstValue.includes("desktop-updater.cjs") ||
         !firstValue.includes("new EL.Tray(n.defaultIcon/* codex-windows-ssh: unsigned tray */)") ||
         firstValue.includes("Automatic updates are unavailable right now.") ||
         !secondValue.equals(second)
@@ -703,6 +764,14 @@ function selfTest() {
       if (firstEntry.entry.integrity.hash !== hash(firstValue)) {
         throw new Error("ASAR self-test integrity mismatch");
       }
+      let dispatched = false;
+      runInNewContext(firstValue.toString('utf8') + ';SyntheticUpdateMenu.click();', {
+        UL: () => ({ info() {} }), UM: {},
+        EL: { dialog: { showMessageBox: () => { throw new Error('Menu dispatch failed'); } } },
+        process: { resourcesPath: join(root, 'runtime', 'app', 'resources') },
+        require: name => name === 'node:path' ? { join } : { check: () => { dispatched = true; } },
+      });
+      if (!dispatched) throw new Error('Scope-preserving menu dispatch failed');
     } finally {
       closeSync(parsed.fd);
     }
@@ -767,7 +836,7 @@ function selfTest() {
         if (name === 'node:path') return { resolve, join };
         throw new Error(`Unexpected shell integration dependency: ${name}`);
       },
-      process: { resourcesPath: join(root, 'runtime', 'app', 'resources') },
+      process: { env: {}, resourcesPath: join(root, 'runtime', 'app', 'resources') },
     });
     const windowEvents = new Map();
     events.get('browser-window-created')({}, {
@@ -804,7 +873,7 @@ function selfTest() {
 const args = process.argv.slice(2);
 let result;
 if (args[0] === "--self-test" && args.length === 1) {
-  result = selfTest();
+  result = await selfTest();
 } else if (args[0] === "--check" && args.length === 2) {
   result = patchArchive(args[1], null, true);
 } else if (args[0] === "--verify" && args.length === 2) {

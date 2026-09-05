@@ -47,6 +47,9 @@ jobs:
       - name: Validate safe runtime cleanup
         shell: pwsh
         run: ./Test-CodexRuntimeCleanup.ps1
+      - name: Validate updater trust and failure boundaries
+        shell: pwsh
+        run: ./Test-CodexUpdater.ps1
       - name: Compile stable taskbar launcher
         shell: pwsh
         run: |

@@ -3,7 +3,7 @@ Option Explicit
 Dim fso, shell, scriptDirectory, parentDirectory, canonicalRoot
 Dim basePath, runtimeBase, appPath, validationMode
 Dim currentVersionPath, currentVersion, currentFile
-Dim autoUpdateMarker, updaterPath, updateCommand, updateExitCode
+Dim cleanupPath, cleanupCommand, cleanupExitCode
 Dim processService, processes, processItem, processPath, otherProcessPath
 Dim sameProcessRunning, launchProbeAvailable, launchedProcessRunning
 Dim launchExitCode, launchErrorNumber, launchErrorDescription
@@ -90,26 +90,13 @@ If Len(otherProcessPath) > 0 Then
     WScript.Quit 3
 End If
 
-autoUpdateMarker = fso.BuildPath(basePath, "auto-update.enabled")
-updaterPath = fso.BuildPath(fso.BuildPath(basePath, "updater"), "Update-Codex-Windows-SSH.ps1")
-If Not sameProcessRunning And fso.FileExists(autoUpdateMarker) And fso.FileExists(updaterPath) Then
-    updateCommand = "pwsh.exe -NoLogo -NoProfile -NonInteractive -File " & _
-        Chr(34) & updaterPath & Chr(34)
-    updateExitCode = shell.Run(updateCommand, 0, True)
-    If updateExitCode <> 0 Then
-        WriteLaunchState "update-failed", "exitCode=" & CStr(updateExitCode)
-        MsgBox "Codex update or validation failed. The last validated runtime will be started." & vbCrLf & _
-            "Details: " & fso.BuildPath(basePath, "last-update.json"), vbExclamation, "Codex"
-    End If
-
-    runtimeBase = basePath
-    If fso.FileExists(currentVersionPath) Then
-        Set currentFile = fso.OpenTextFile(currentVersionPath, 1, False)
-        currentVersion = Trim(Replace(Replace(currentFile.ReadAll, vbCr, ""), vbLf, ""))
-        currentFile.Close
-        If Len(currentVersion) > 0 Then runtimeBase = fso.BuildPath(basePath, currentVersion)
-    End If
-    appPath = fso.BuildPath(fso.BuildPath(runtimeBase, "app"), "ChatGPT.exe")
+' Retry only local cleanup before the new app locks shared DLL/PAK hardlinks.
+' Online checks start inside the app so progress uses the official themed card.
+cleanupPath = fso.BuildPath(fso.BuildPath(basePath, "updater"), "Remove-OldCodexRuntimes.ps1")
+If Not sameProcessRunning And fso.FileExists(cleanupPath) Then
+    cleanupCommand = "pwsh.exe -NoLogo -NoProfile -NonInteractive -File " & Chr(34) & cleanupPath & Chr(34)
+    cleanupExitCode = shell.Run(cleanupCommand, 0, True)
+    If cleanupExitCode <> 0 Then WriteLaunchState "cleanup-deferred", "exitCode=" & CStr(cleanupExitCode)
 End If
 
 If Not fso.FileExists(appPath) Then

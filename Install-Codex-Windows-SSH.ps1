@@ -4,13 +4,15 @@ param(
     [switch]$EnableAutoUpdate,
     [switch]$DisableAutoUpdate,
     [switch]$CheckForUpdate,
-    [switch]$ShowProgress
+    [switch]$ShowProgress,
+    [string]$PackageRoot,
+    [scriptblock]$ProgressCallback
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = if ($ShowProgress) { 'Continue' } else { 'SilentlyContinue' }
-$script:ValidationSchemaVersion = 6
+$script:ValidationSchemaVersion = 10
 
 if ($EnableAutoUpdate -and $DisableAutoUpdate) {
     throw 'EnableAutoUpdate and DisableAutoUpdate cannot be used together.'
@@ -24,6 +26,7 @@ if ($PSVersionTable.PSEdition -ne 'Core') {
     if ($DisableAutoUpdate) { $arguments += '-DisableAutoUpdate' }
     if ($CheckForUpdate) { $arguments += '-CheckForUpdate' }
     if ($ShowProgress) { $arguments += '-ShowProgress' }
+    if ($PackageRoot) { $arguments += @('-PackageRoot', $PackageRoot) }
     & $pwsh.Source @arguments
     exit $LASTEXITCODE
 }
@@ -37,6 +40,7 @@ function Write-InstallProgress {
     if ($ShowProgress) {
         Write-Progress -Id 1 -Activity 'Updating Codex Windows SSH' -Status $Status -PercentComplete $Percent
     }
+    if ($ProgressCallback) { & $ProgressCallback $Percent $Status }
 }
 
 function Test-ValidationStamp {
@@ -288,7 +292,8 @@ function Test-PatchedRuntime {
     $runtimeExe = Join-Path $RuntimeRoot 'ChatGPT.exe'
     $runtimeAsar = Join-Path $RuntimeRoot 'resources\app.asar'
     $runtimeCli = Join-Path $RuntimeRoot 'resources\codex.exe'
-    foreach ($required in @($runtimeExe, $runtimeAsar, $runtimeCli)) {
+    $runtimeUpdater = Join-Path $RuntimeRoot 'resources\desktop-updater.cjs'
+    foreach ($required in @($runtimeExe, $runtimeAsar, $runtimeCli, $runtimeUpdater)) {
         if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
             throw "Runtime validation failed; missing file: $required"
         }
@@ -299,12 +304,17 @@ function Test-PatchedRuntime {
         throw "Runtime validation failed; executable signature state is $($signature.Status)"
     }
     $archive = Invoke-NodePatcher -Arguments @($Patcher, '--verify', $runtimeAsar)
+    $node = Get-Command node.exe -ErrorAction Stop
+    & $node.Source --check $runtimeUpdater
+    if ($LASTEXITCODE -ne 0) { throw 'Runtime updater syntax validation failed.' }
     $embeddedIntegrity = Invoke-ElectronAsarIntegrity -Mode verify -Tool $IntegrityTool -Executable $runtimeExe -Asar $runtimeAsar
     $cliOutput = @(& $runtimeCli --version 2>&1)
     $cliExitCode = $LASTEXITCODE
     if ($cliExitCode -ne 0) {
         throw "Runtime validation failed; bundled Codex CLI exited with code $cliExitCode"
     }
+    Write-InstallProgress -Percent 88 -Status '正在验证隔离桌面启动与页面加载（不使用当前账号配置）…'
+    $startup = & (Join-Path $PSScriptRoot 'Test-CodexStartup.ps1') -RuntimeRoot $RuntimeRoot
 
     return [pscustomobject]@{
         schemaVersion = $script:ValidationSchemaVersion
@@ -315,6 +325,8 @@ function Test-PatchedRuntime {
         embeddedAsarIntegrityLanguages = @($embeddedIntegrity.languages)
         mainBundleSha256 = $archive.mainSha256
         bundledCliVersion = ($cliOutput -join [Environment]::NewLine).Trim()
+        desktopStartup = $startup
+        desktopUpdaterSha256 = (Get-FileHash -LiteralPath $runtimeUpdater -Algorithm SHA256).Hash
     }
 }
 
@@ -324,7 +336,8 @@ function New-RebasedRuntime {
         [Parameter(Mandatory)][string]$TargetRoot,
         [Parameter(Mandatory)][string]$SourceAsar,
         [Parameter(Mandatory)][string]$PatchedAsar,
-        [string]$ReuseRoot
+        [string]$ReuseRoot,
+        [switch]$LinkVerifiedSource
     )
 
     $sourceFull = [IO.Path]::GetFullPath($SourceRoot).TrimEnd('\')
@@ -399,6 +412,14 @@ function New-RebasedRuntime {
                 $copiedFiles += 1
                 $copiedBytes += $file.Length
             }
+        } elseif ($LinkVerifiedSource -and -not $relative.Equals('ChatGPT.exe', [StringComparison]::OrdinalIgnoreCase)) {
+            try {
+                New-Item -ItemType HardLink -Path $destination -Target $file.FullName | Out-Null
+                $hardlinkedFiles += 1
+            } catch {
+                Copy-Item -LiteralPath $file.FullName -Destination $destination
+                $copiedFiles += 1; $copiedBytes += $file.Length
+            }
         } else {
             Copy-Item -LiteralPath $file.FullName -Destination $destination
             $copiedFiles += 1
@@ -440,12 +461,19 @@ $queryArguments = @(
     '-File',
     $queryScript
 )
-$packageJson = @(& $windowsPowerShell @queryArguments)
-$queryExitCode = $LASTEXITCODE
-if ($queryExitCode -ne 0) {
-    throw "Codex package query failed with exit code $queryExitCode"
+if ($PackageRoot) {
+    [xml]$manifest = Get-Content -LiteralPath (Join-Path $PackageRoot 'AppxManifest.xml') -Raw
+    $identity = $manifest.Package.Identity
+    if ($identity.Name -ne 'OpenAI.Codex' -or $identity.Publisher -ne 'CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B' -or
+        $identity.Version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'Unexpected package identity.' }
+    $package = [pscustomobject]@{ version=$identity.Version; installLocation=[IO.Path]::GetFullPath($PackageRoot);
+        packageFullName="OpenAI.Codex_$($identity.Version)_$($identity.ProcessorArchitecture)__2p2nqsd0c76g0" }
+} else {
+    $packageJson = @(& $windowsPowerShell @queryArguments)
+    $queryExitCode = $LASTEXITCODE
+    if ($queryExitCode -ne 0) { throw "Codex package query failed with exit code $queryExitCode" }
+    $package = ($packageJson -join [Environment]::NewLine) | ConvertFrom-Json
 }
-$package = ($packageJson -join [Environment]::NewLine) | ConvertFrom-Json
 
 $installRoot = Join-Path (Join-Path $env:LOCALAPPDATA 'OpenAI') 'Codex-Windows-SSH'
 $currentVersionPath = Join-Path $installRoot 'current.version'
@@ -491,7 +519,7 @@ foreach ($required in @($sourceExe, $sourceAsar)) {
 }
 Write-InstallProgress -Percent 8 -Status "Checking official signature ($($package.version))"
 $signature = Get-AuthenticodeSignature -LiteralPath $sourceExe
-if ($signature.Status -ne 'Valid') {
+if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O="?OpenAI OpCo, LLC"?') {
     throw "The official Codex executable signature is not valid: $($signature.Status)"
 }
 
@@ -505,6 +533,7 @@ $updaterRoot = Join-Path $installRoot 'updater'
 $integrityTool = Join-Path $updaterRoot 'ElectronAsarIntegrity.exe'
 Write-InstallProgress -Percent 12 -Status 'Building the Electron ASAR integrity validator'
 Publish-ElectronAsarIntegrityTool -Source $integrityToolSource -Destination $integrityTool
+Invoke-ElectronAsarIntegrity -Mode verify -Tool $integrityTool -Executable $sourceExe -Asar $sourceAsar | Out-Null
 
 $selectedRuntimeRoot = $null
 if (Test-Path -LiteralPath $currentVersionPath -PathType Leaf) {
@@ -529,6 +558,13 @@ $runtimeComplete = [bool](
     (Test-Path -LiteralPath (Join-Path $runtimeRoot 'resources\codex.exe') -PathType Leaf)
 )
 $runtimeRebuild = -not $runtimeComplete -or -not (Test-ValidationStamp -MetadataPath $metadataPath -Package $package)
+if ($runtimeRebuild -and $runtimeExists) {
+    $activeReferences = @(Get-CimInstance Win32_Process | Where-Object {
+        ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($runtimeRoot + '\', [StringComparison]::OrdinalIgnoreCase)) -or
+        ($_.CommandLine -and $_.CommandLine.Contains($runtimeRoot + '\'))
+    })
+    if ($activeReferences.Count) { throw 'Cannot rebuild a running runtime in place; keep it and use a new patch revision.' }
+}
 $runtimeStats = [pscustomobject]@{
     reuseRoot = $null
     hardlinkedFiles = $null
@@ -564,7 +600,8 @@ if ($runtimeRebuild) {
                 Select-Object -First 1
         }
         Write-InstallProgress -Percent 40 -Status 'Rebasing the official runtime'
-        $runtimeStats = New-RebasedRuntime -SourceRoot $sourceApp -TargetRoot $stagingRoot -SourceAsar $sourceAsar -PatchedAsar $patchedAsar -ReuseRoot $reuseRoot
+        $runtimeStats = New-RebasedRuntime -SourceRoot $sourceApp -TargetRoot $stagingRoot -SourceAsar $sourceAsar -PatchedAsar $patchedAsar -ReuseRoot $reuseRoot -LinkVerifiedSource:([bool]$PackageRoot)
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'desktop-updater.cjs') -Destination (Join-Path $stagingRoot 'resources\desktop-updater.cjs')
         Write-InstallProgress -Percent 84 -Status 'Synchronizing Electron ASAR integrity'
         Invoke-ElectronAsarIntegrity -Mode sync -Tool $integrityTool -Executable (Join-Path $stagingRoot 'ChatGPT.exe') -Asar (Join-Path $stagingRoot 'resources\app.asar') | Out-Null
         Write-InstallProgress -Percent 86 -Status 'Validating the staged runtime and bundled CLI'
@@ -653,17 +690,22 @@ foreach ($name in @(
     'Update-Codex-Windows-SSH.ps1',
     'Get-CodexPackage.ps1',
     'patch-codex-asar.mjs',
+    'patch-update-card.mjs',
     'windows-shell-identity.cjs',
     'Remove-OldCodexRuntimes.ps1',
     'codex-windows-controller.ps1',
     'Start-Codex.vbs',
     'CodexLauncher.cs',
     'ElectronAsarIntegrity.cs'
+    'desktop-updater.cjs'
+    'Test-CodexStartup.ps1'
 )) {
     $source = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $name))
     $destination = [IO.Path]::GetFullPath((Join-Path $updaterRoot $name))
     if (-not $source.Equals($destination, [StringComparison]::OrdinalIgnoreCase)) {
-        Copy-Item -LiteralPath $source -Destination $destination -Force
+        $publishTemporary = $destination + '.publishing-' + [guid]::NewGuid().ToString('N')
+        Copy-Item -LiteralPath $source -Destination $publishTemporary
+        [IO.File]::Move($publishTemporary, $destination, $true)
     }
 }
 
@@ -768,5 +810,5 @@ if ($ShowProgress) { Write-Progress -Id 1 -Activity 'Updating Codex Windows SSH'
     autoUpdateEnabled = $autoUpdateEnabled
     shortcuts = $shortcutPaths
     shortcutBackups = $shortcutBackups
-    instruction = 'Exit the older patched desktop process, then open Start > Codex_Fix. Pin that stable Start entry once if desired; enabled updates are checked, shown, validated, and selected before launch. Official ChatGPT is a separate entry.'
+    instruction = 'Exit the older patched desktop process, then open Codex_Fix from the stable desktop/taskbar entry. Enabled update checks run inside the app with its official themed card; restart only when ready. Official ChatGPT is separate.'
 } | ConvertTo-Json -Depth 3
