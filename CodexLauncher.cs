@@ -1,7 +1,12 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Windows.Forms;
+
+[assembly: AssemblyTitle("Codex_Fix")]
+[assembly: AssemblyProduct("Codex_Fix")]
+[assembly: AssemblyDescription("Stable launcher for Codex Windows SSH")]
 
 internal static class Program
 {
@@ -50,7 +55,7 @@ internal static class Program
         {
             MessageBox.Show(
                 error.Message,
-                "Codex launcher",
+                "Codex_Fix launcher",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error
             );

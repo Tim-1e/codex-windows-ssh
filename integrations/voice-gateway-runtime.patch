@@ -1,0 +1,227 @@
+diff --git a/src/codex_assistant/app_server.py b/src/codex_assistant/app_server.py
+index 34448dd..45a0b0c 100644
+--- a/src/codex_assistant/app_server.py
++++ b/src/codex_assistant/app_server.py
+@@ -5,7 +5,11 @@ from collections.abc import Awaitable, Callable
+ import json
+ import logging
+ import os
++from pathlib import Path
++import re
+ import shutil
++import subprocess
++import tomllib
+ from typing import Any
+ 
+ 
+@@ -16,9 +20,66 @@ class AppServerError(RuntimeError):
+     pass
+ 
+ 
++def resolve_codex_launch(command: str, env: dict[str, str]) -> tuple[str, list[str]]:
++    """Follow the validated install pointer, without rewriting global config."""
++    executable = shutil.which(command, path=env.get("PATH")) or command
++    if not env.get("LOCALAPPDATA"):
++        return executable, []
++    root = Path(env["LOCALAPPDATA"]) / "OpenAI" / "Codex-Windows-SSH"
++    pointer = root / "current.version"
++    if not pointer.is_file():
++        return executable, []
++    runtime_id = pointer.read_text(encoding="utf-8").strip()
++    if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+(?:-r\d+)?", runtime_id):
++        raise AppServerError("Invalid current Codex runtime ID")
++    runtime = root / runtime_id
++    metadata = json.loads((runtime / "installed.json").read_text(encoding="utf-8"))
++    if metadata.get("validation", {}).get("status") != "passed":
++        raise AppServerError("The selected Codex runtime is not validated")
++    app = runtime / "app"
++    bundled_cli = app / "resources" / "codex.exe"
++    if not bundled_cli.is_file():
++        raise AppServerError("The selected Codex runtime has no bundled CLI")
++    if command.lower() in ("codex", "codex.exe"):
++        executable = str(bundled_cli)
++
++    config_path = Path(env.get("CODEX_HOME", str(Path.home() / ".codex"))) / "config.toml"
++    if not config_path.is_file():
++        return executable, []
++    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
++    # Only rebase this installation's generated paths. Custom MCPs, trust
++    # hashes, permissions, credentials, and other user settings remain intact.
++    old_app = re.compile(
++        re.escape(root.as_posix()) + r"/\d+\.\d+\.\d+\.\d+(?:-r\d+)?/app(?=/|$)",
++        re.IGNORECASE,
++    )
++
++    def rebase(value: Any) -> Any:
++        if isinstance(value, list):
++            return [rebase(item) for item in value]
++        if isinstance(value, str) and old_app.search(value.replace("\\", "/")):
++            return old_app.sub(lambda _: app.as_posix(), value.replace("\\", "/"))
++        return value
++
++    overrides: list[str] = []
++
++    def visit(key: str, value: Any) -> None:
++        if isinstance(value, dict):
++            for name, item in value.items():
++                visit(key + "." + json.dumps(name), item)
++        else:
++            updated = rebase(value)
++            if updated != value:
++                overrides.extend(("-c", key + "=" + json.dumps(updated, ensure_ascii=False)))
++
++    visit("notify", config.get("notify"))
++    visit("mcp_servers.node_repl", config.get("mcp_servers", {}).get("node_repl", {}))
++    return executable, overrides
++
++
+ class AppServerClient:
+     def __init__(self, command: str) -> None:
+-        self.command = shutil.which(command) or command
++        self.command = command
+         self.process: asyncio.subprocess.Process | None = None
+         self._next_id = 1
+         self._pending: dict[int, asyncio.Future[Any]] = {}
+@@ -44,8 +105,11 @@ class AppServerClient:
+                 env.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps"
+             ).lower()
+         )
++        executable, overrides = resolve_codex_launch(self.command, env)
++        self.log.info("Resolved Codex runtime: %s; path overrides=%s", executable, len(overrides) // 2)
+         self.process = await asyncio.create_subprocess_exec(
+-            self.command,
++            executable,
++            *overrides,
+             "app-server",
+             "--listen",
+             "stdio://",
+@@ -53,6 +117,7 @@ class AppServerClient:
+             stdout=asyncio.subprocess.PIPE,
+             stderr=asyncio.subprocess.PIPE,
+             env=env,
++            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+         )
+         self._reader_task = asyncio.create_task(self._read_stdout())
+         self._stderr_task = asyncio.create_task(self._read_stderr())
+
+diff --git a/scripts/stop-gateway.ps1 b/scripts/stop-gateway.ps1
+index c9fc9b7..0dfdc2b 100644
+--- a/scripts/stop-gateway.ps1
++++ b/scripts/stop-gateway.ps1
+@@ -16,11 +16,27 @@ if ($process.ProcessName -notin @("python", "python3")) {
+     throw "Refusing to stop unexpected process $($process.ProcessName) (PID $gatewayPid)."
+ }
+ 
+-$children = Get-CimInstance Win32_Process |
+-    Where-Object { $_.ParentProcessId -eq $gatewayPid }
+-foreach ($child in $children) {
+-    Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue
++$snapshot = @(Get-CimInstance Win32_Process)
++$gateway = $snapshot | Where-Object ProcessId -eq $gatewayPid
++$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
++if (-not $gateway -or $gateway.CommandLine -notmatch 'codex-voice-gateway|codex_assistant\.main' -or
++    $gateway.CommandLine.IndexOf($root, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
++    throw "Refusing to stop a listener that is not this gateway (PID $gatewayPid)."
++}
++$ids = [Collections.Generic.List[int]]::new()
++$ids.Add($gatewayPid)
++for ($index = 0; $index -lt $ids.Count; $index++) {
++    foreach ($child in $snapshot | Where-Object ParentProcessId -eq $ids[$index]) {
++        if (-not $ids.Contains([int]$child.ProcessId)) { $ids.Add([int]$child.ProcessId) }
++    }
++}
++# Stop descendants before parents, including persistent MCP grandchildren.
++# A one-level stop leaves node_repl holding an obsolete desktop runtime open.
++for ($index = $ids.Count - 1; $index -ge 0; $index--) {
++    $target = $snapshot | Where-Object ProcessId -eq $ids[$index]
++    $current = Get-CimInstance Win32_Process -Filter "ProcessId=$($target.ProcessId)"
++    if ($current -and $current.CreationDate -eq $target.CreationDate) {
++        Stop-Process -Id $target.ProcessId -Force -ErrorAction Stop
++    }
+ }
+-Stop-Process -Id $gatewayPid -Force
+ Write-Output "Stopped gateway PID $gatewayPid."
+-
+
+diff --git a/README.md b/README.md
+index 478dfa2..8447570 100644
+--- a/README.md
++++ b/README.md
+@@ -56,6 +56,15 @@ high-level stream events to `logs\events.jsonl`.
+ All paths in `config\gateway.toml` are resolved relative to the gateway root,
+ so each copied deployment keeps an independent workspace, thread state, and log.
+ 
++On Windows, the generic `command = "codex"` follows the validated
++`%LOCALAPPDATA%\OpenAI\Codex-Windows-SSH\current.version` selection when that
++installation exists; otherwise it uses PATH. No release number is configured.
++At each App Server start, desktop-generated node_repl/notify paths for this
++installation are rebased to the same runtime using process-local CLI overrides.
++Global Codex configuration, credentials, custom tools, and permissions are not
++rewritten. Explicit custom executable commands remain respected. Restart the
++gateway after a desktop runtime update to release the previous runtime files.
++
+ Final Codex output is constrained to two channels. `spoken_response` is short,
+ plain Chinese for TTS; `display_response` keeps Markdown, paths, commands, and
+ technical detail for logs or a future UI. The WebSocket `task.final.text` field
+
+diff --git a/tests/test_runtime_resolution.py b/tests/test_runtime_resolution.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_runtime_resolution.py
+@@ -0,0 +1,56 @@
++import json
++from pathlib import Path
++import tempfile
++import tomllib
++import unittest
++
++from codex_assistant.app_server import AppServerError, resolve_codex_launch
++
++
++class RuntimeResolutionTest(unittest.TestCase):
++    def test_current_pointer_rebases_only_owned_paths(self):
++        with tempfile.TemporaryDirectory() as directory:
++            base = Path(directory)
++            root = base / "OpenAI" / "Codex-Windows-SSH"
++            config_home = base / "config"
++            config_home.mkdir()
++            root.mkdir(parents=True)
++            env = {"LOCALAPPDATA": str(base), "CODEX_HOME": str(config_home), "PATH": ""}
++            old = root / "1.2.3.4-r1" / "app"
++            original = (
++                f"notify = [{json.dumps(str(old / 'notify.exe'))}, 'turn-ended']\n"
++                "[mcp_servers.node_repl]\n"
++                f"command = {json.dumps(str(old / 'node_repl.exe'))}\n"
++                "[mcp_servers.node_repl.env]\n"
++                f"NODE_REPL_NODE_MODULE_DIRS = {json.dumps(str(old / 'node_modules'))}\n"
++                "CUSTOM_PATH = 'C:/unrelated/keep'\n"
++                "TRUSTED_HASH = 'do-not-change'\n"
++            )
++            config = config_home / "config.toml"
++            config.write_text(original, encoding="utf-8")
++            for runtime_id in ("2.3.4.5-r2", "3.4.5.6-r3"):
++                runtime = root / runtime_id
++                resources = runtime / "app" / "resources"
++                resources.mkdir(parents=True)
++                cli = resources / "codex.exe"
++                cli.touch()
++                (runtime / "installed.json").write_text(json.dumps({"validation": {"status": "passed"}}))
++                (root / "current.version").write_text(runtime_id + "\n")
++                executable, overrides = resolve_codex_launch("codex", env)
++                self.assertEqual(Path(executable), cli)
++                parsed = tomllib.loads("\n".join(overrides[1::2]))
++                self.assertEqual(Path(parsed["mcp_servers"]["node_repl"]["command"]), runtime / "app" / "node_repl.exe")
++                self.assertNotIn("CUSTOM_PATH", " ".join(overrides))
++                self.assertNotIn("TRUSTED_HASH", " ".join(overrides))
++                self.assertEqual(config.read_text(encoding="utf-8"), original)
++                self.assertEqual(resolve_codex_launch("custom-codex", env)[0], "custom-codex")
++            (root / "current.version").write_text("../outside")
++            with self.assertRaises(AppServerError):
++                resolve_codex_launch("codex", env)
++
++    def test_normal_path_installation_is_unchanged(self):
++        self.assertEqual(resolve_codex_launch("custom-codex", {"PATH": ""}), ("custom-codex", []))
++
++
++if __name__ == "__main__":
++    unittest.main()

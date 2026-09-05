@@ -8,7 +8,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = if ($Interactive) { 'Continue' } else { 'SilentlyContinue' }
-$script:ValidationSchemaVersion = 4
+$script:ValidationSchemaVersion = 6
 
 $installer = Join-Path $PSScriptRoot 'Install-Codex-Windows-SSH.ps1'
 $queryScript = Join-Path $PSScriptRoot 'Get-CodexPackage.ps1'

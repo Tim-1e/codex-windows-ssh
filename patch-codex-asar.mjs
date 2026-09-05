@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { runInNewContext } from "node:vm";
 
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const align4 = (value) => (value + 3) & ~3;
@@ -444,6 +445,20 @@ function patchMainBundle(source, controllerScript) {
   };
 }
 
+function patchBootstrapBundle(source) {
+  const text = source.toString('utf8');
+  const binding = matchExactlyOnce(
+    text,
+    /(?<call>[A-Za-z_$][\w$]*\.app\.setAppUserModelId\([A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\)\))/gu,
+    'Windows application identity',
+  );
+  const identity = readFileSync(new URL('./windows-shell-identity.cjs', import.meta.url), 'utf8').trim();
+  const replacement = identity.replace(/;$/u, '');
+  const output = Buffer.from(text.replace(binding.call, () => replacement));
+  assertNodeSyntax(output, 'Patched bootstrap bundle');
+  return output;
+}
+
 function verifyArchive(archivePath) {
   const parsed = parseArchive(archivePath);
   try {
@@ -504,6 +519,16 @@ function verifyArchive(archivePath) {
       throw new Error("Patched main ASAR integrity blocks do not match its bytes");
     }
     assertNodeSyntax(source, "Verified main bundle");
+    const bootstrap = findMainEntry(parsed, 'bootstrap');
+    const bootstrapSource = readExact(parsed.fd, bootstrap.size, parsed.dataOffset + bootstrap.offset);
+    if (!bootstrapSource.includes('codex-windows-ssh: stable Windows shell identity') ||
+        !bootstrapSource.includes('com.openai.codex.windows-ssh') ||
+        !bootstrapSource.includes('Codex_Fix.ico') ||
+        !bootstrapSource.includes('relaunchCommand:') ||
+        JSON.stringify(makeIntegrity(bootstrapSource, bootstrap.entry.integrity?.blockSize)) !== JSON.stringify(bootstrap.entry.integrity)) {
+      throw new Error('Patched bootstrap identity or integrity is invalid');
+    }
+    assertNodeSyntax(bootstrapSource, 'Verified bootstrap bundle');
     return {
       ok: true,
       verified: true,
@@ -518,12 +543,12 @@ function verifyArchive(archivePath) {
   }
 }
 
-function findMainEntry(parsed) {
+function findMainEntry(parsed, kind = 'main') {
   const candidates = parsed.entries.filter((item) =>
-    /^\.vite\/build\/main-[^/]+\.js$/u.test(item.path),
+    new RegExp(`^\\.vite/build/${kind}-[^/]+\\.js$`, 'u').test(item.path),
   );
   if (candidates.length !== 1) {
-    throw new Error(`Expected one Electron main bundle, found ${candidates.length}`);
+    throw new Error(`Expected one Electron ${kind} bundle, found ${candidates.length}`);
   }
   return candidates[0];
 }
@@ -532,6 +557,8 @@ function patchArchive(inputPath, outputPath, checkOnly = false) {
   const parsed = parseArchive(inputPath);
   let result;
   let main;
+  let bootstrap;
+  let bootstrapOutput;
   try {
     main = findMainEntry(parsed);
     const source = readExact(parsed.fd, main.size, parsed.dataOffset + main.offset);
@@ -540,17 +567,20 @@ function patchArchive(inputPath, outputPath, checkOnly = false) {
       "utf8",
     ).replace(/\r\n/gu, "\n");
     result = patchMainBundle(source, controllerScript);
+    bootstrap = findMainEntry(parsed, 'bootstrap');
+    bootstrapOutput = patchBootstrapBundle(readExact(parsed.fd, bootstrap.size, parsed.dataOffset + bootstrap.offset));
   } finally {
     closeSync(parsed.fd);
   }
   if (!checkOnly) {
-    rewriteArchive(inputPath, outputPath, new Map([[main.path, result.output]]));
+    rewriteArchive(inputPath, outputPath, new Map([[main.path, result.output], [bootstrap.path, bootstrapOutput]]));
   }
   return {
     ok: true,
     checkOnly,
     compatibility: result.compatibility,
     mainEntryPath: main.path,
+    bootstrapEntryPath: bootstrap.path,
     inputMainSha256: result.inputHash,
     outputMainSha256: result.outputHash,
     inputAsar: resolve(inputPath),
@@ -600,6 +630,7 @@ function selfTest() {
       updateManager: "UM",
       electron: "EL",
     });
+    const bootstrap = Buffer.from('process.platform===`win32`&&EL.app.setAppUserModelId(ID.get(flavor));');
     const second = Buffer.from([0, 1, 2, 3]);
     const header = {
       files: {
@@ -612,6 +643,11 @@ function selfTest() {
                   offset: "0",
                   integrity: makeIntegrity(first),
                 },
+                'bootstrap-test.js': {
+                  size: bootstrap.length,
+                  offset: String(first.length),
+                  integrity: makeIntegrity(bootstrap),
+                },
               },
             },
           },
@@ -620,7 +656,7 @@ function selfTest() {
           files: {
             "second.bin": {
               size: second.length,
-              offset: String(first.length),
+              offset: String(first.length + bootstrap.length),
               integrity: makeIntegrity(second),
             },
           },
@@ -631,7 +667,7 @@ function selfTest() {
     const fd = openSync(input, "wx");
     try {
       let position = 0;
-      for (const value of [sizePickle, headerPickle, first, second]) {
+      for (const value of [sizePickle, headerPickle, first, bootstrap, second]) {
         writeExact(fd, value, position);
         position += value.length;
       }
@@ -688,9 +724,11 @@ function selfTest() {
       electron: "eL",
     });
     const renamedResult = patchMainBundle(renamed, "Write-Output test");
+    const renamedBootstrap = patchBootstrapBundle(Buffer.from('process.platform===`win32`&&another.app.setAppUserModelId(flavorHelper.appId(buildFlavor));'));
     if (
       !renamedResult.output.includes("env:n.hi(process.env)") ||
-      !renamedResult.output.includes("new eL.Tray(n.defaultIcon/* codex-windows-ssh: unsigned tray */)")
+      !renamedResult.output.includes("new eL.Tray(n.defaultIcon/* codex-windows-ssh: unsigned tray */)") ||
+      !renamedBootstrap.includes('com.openai.codex.windows-ssh')
     ) {
       throw new Error("Renamed binding self-test failed");
     }
@@ -715,11 +753,48 @@ function selfTest() {
     if (!rejectedChangedStructure) {
       throw new Error("Changed structure did not fail closed");
     }
+    const events = new Map();
+    const shellState = {};
+    const fakeApp = {
+      getName: () => 'ChatGPT',
+      setName: value => { shellState.name = value; },
+      setAppUserModelId: value => { shellState.id = value; },
+      on: (event, handler) => events.set(event, handler),
+    };
+    runInNewContext(readFileSync(new URL('./windows-shell-identity.cjs', import.meta.url), 'utf8'), {
+      require: name => {
+        if (name === 'electron') return { app: fakeApp };
+        if (name === 'node:path') return { resolve, join };
+        throw new Error(`Unexpected shell integration dependency: ${name}`);
+      },
+      process: { resourcesPath: join(root, 'runtime', 'app', 'resources') },
+    });
+    const windowEvents = new Map();
+    events.get('browser-window-created')({}, {
+      setAppDetails: value => { shellState.details = value; },
+      setIcon: value => { shellState.icon = value; },
+      getTitle: () => 'ChatGPT',
+      setTitle: value => { shellState.title = value; },
+      on: (event, handler) => windowEvents.set(event, handler),
+    });
+    let suppressedTitle = false;
+    windowEvents.get('page-title-updated')({ preventDefault: () => { suppressedTitle = true; } }, 'ChatGPT');
+    if (shellState.name !== 'Codex_Fix' || shellState.id !== 'com.openai.codex.windows-ssh' ||
+        shellState.details.appId !== shellState.id || shellState.title !== shellState.name ||
+        shellState.details.relaunchCommand !== '"' + join(root, 'CodexLauncher.exe') + '"' ||
+        shellState.icon !== join(root, 'Codex_Fix.ico') || !suppressedTitle) {
+      throw new Error('Stable Windows shell integration self-test failed');
+    }
+    // Regression: the shipped Owl runtime does not implement setAppDetails.
+    // Do not give every mock the API whose absence broke the real startup.
+    events.get('browser-window-created')({}, { on() {} });
     return {
       ok: true,
       selfTest: true,
       structuralCompatibility: true,
       changedStructureFailsClosed: true,
+      stableWindowsShellIdentity: true,
+      missingOptionalWindowApis: true,
     };
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -10,7 +10,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = if ($ShowProgress) { 'Continue' } else { 'SilentlyContinue' }
-$script:ValidationSchemaVersion = 4
+$script:ValidationSchemaVersion = 6
 
 if ($EnableAutoUpdate -and $DisableAutoUpdate) {
     throw 'EnableAutoUpdate and DisableAutoUpdate cannot be used together.'
@@ -97,6 +97,43 @@ function Test-OwnedLauncherShortcut {
     return $hostOwned -or $runtimeOwned
 }
 
+function Set-CodexShortcutAppId {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not ('CodexShortcutIdentity' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CodexShortcutIdentity {
+    [StructLayout(LayoutKind.Sequential)] struct Key { public Guid Format; public uint Id; }
+    [StructLayout(LayoutKind.Explicit, Size=24)] struct Value {
+        [FieldOffset(0)] public ushort Type;
+        [FieldOffset(8)] public IntPtr Text;
+    }
+    [ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface Store {
+        void GetCount(out uint count);
+        void GetAt(uint index, out Key key);
+        void GetValue(ref Key key, out Value value);
+        void SetValue(ref Key key, ref Value value);
+        void Commit();
+    }
+    [DllImport("shell32.dll", CharSet=CharSet.Unicode, PreserveSig=false)]
+    static extern void SHGetPropertyStoreFromParsingName(string path, IntPtr context, uint flags, ref Guid iid, out Store store);
+    public static void Set(string path) {
+        var iid = typeof(Store).GUID;
+        Store store;
+        SHGetPropertyStoreFromParsingName(path, IntPtr.Zero, 2, ref iid, out store);
+        var key = new Key { Format=new Guid("9f4c2855-9f79-4b39-a8d0-e1d42de1d5f3"), Id=5 };
+        var value = new Value { Type=31, Text=Marshal.StringToCoTaskMemUni("com.openai.codex.windows-ssh") };
+        try { store.SetValue(ref key, ref value); store.Commit(); }
+        finally { Marshal.FreeCoTaskMem(value.Text); Marshal.FinalReleaseComObject(store); }
+    }
+}
+'@
+    }
+    [CodexShortcutIdentity]::Set($Path)
+}
+
 function New-CodexLauncherShortcut {
     param(
         [Parameter(Mandatory)]$Shell,
@@ -115,8 +152,9 @@ function New-CodexLauncherShortcut {
         $shortcut.Arguments = ''
         $shortcut.WorkingDirectory = $InstallRoot
         $shortcut.IconLocation = $Icon + ',0'
-        $shortcut.Description = 'Codex'
+        $shortcut.Description = 'Codex_Fix'
         $shortcut.Save()
+        Set-CodexShortcutAppId -Path $temporary
 
         [IO.File]::Move($temporary, $Path, $true)
     } finally {
@@ -129,7 +167,8 @@ function New-CodexLauncherShortcut {
 function Publish-CodexLauncherHost {
     param(
         [Parameter(Mandatory)][string]$Source,
-        [Parameter(Mandatory)][string]$Destination
+        [Parameter(Mandatory)][string]$Destination,
+        [string]$Icon
     )
 
     $compiler = @(
@@ -143,7 +182,7 @@ function Publish-CodexLauncherHost {
     $directory = [IO.Path]::GetDirectoryName($Destination)
     $temporary = Join-Path $directory ('.codex-launcher-' + [guid]::NewGuid().ToString('N') + '.exe')
     try {
-        $compilerOutput = @(& $compiler @(
+        $compilerArguments = @(
             '/nologo',
             '/target:winexe',
             '/optimize+',
@@ -151,7 +190,9 @@ function Publish-CodexLauncherHost {
             '/reference:System.Windows.Forms.dll',
             "/out:$temporary",
             $Source
-        ) 2>&1)
+        )
+        if ($Icon) { $compilerArguments += "/win32icon:$Icon" }
+        $compilerOutput = @(& $compiler @compilerArguments 2>&1)
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $temporary -PathType Leaf)) {
             throw "Codex launcher compilation failed: $($compilerOutput -join [Environment]::NewLine)"
         }
@@ -612,6 +653,8 @@ foreach ($name in @(
     'Update-Codex-Windows-SSH.ps1',
     'Get-CodexPackage.ps1',
     'patch-codex-asar.mjs',
+    'windows-shell-identity.cjs',
+    'Remove-OldCodexRuntimes.ps1',
     'codex-windows-controller.ps1',
     'Start-Codex.vbs',
     'CodexLauncher.cs',
@@ -630,8 +673,8 @@ foreach ($existingVersion in Get-ChildItem -LiteralPath $installRoot -Directory 
     if ($existingVersion.Name -notmatch '^\d+\.\d+\.\d+\.\d+(?:-r\d+)?$') { continue }
     Copy-Item -LiteralPath $launcherTemplate -Destination (Join-Path $existingVersion.FullName 'Start-Codex.vbs') -Force
 }
-$runtimeIcon = Join-Path $runtimeRoot 'resources\icon-chatgpt.ico'
-$stableIcon = Join-Path $installRoot 'Codex.ico'
+$runtimeIcon = Join-Path $runtimeRoot 'resources\chatgpt-app-dark.ico'
+$stableIcon = Join-Path $installRoot 'Codex_Fix.ico'
 if (Test-Path -LiteralPath $runtimeIcon -PathType Leaf) {
     Copy-Item -LiteralPath $runtimeIcon -Destination $stableIcon -Force
 } elseif (-not (Test-Path -LiteralPath $stableIcon -PathType Leaf)) {
@@ -639,7 +682,7 @@ if (Test-Path -LiteralPath $runtimeIcon -PathType Leaf) {
 }
 $stableLauncherHost = Join-Path $installRoot 'CodexLauncher.exe'
 Write-InstallProgress -Percent 96 -Status 'Building the stable taskbar launcher'
-Publish-CodexLauncherHost -Source $launcherHostSource -Destination $stableLauncherHost
+Publish-CodexLauncherHost -Source $launcherHostSource -Destination $stableLauncherHost -Icon $stableIcon
 $autoUpdateMarker = Join-Path $installRoot 'auto-update.enabled'
 if ($EnableAutoUpdate) {
     [IO.File]::WriteAllText($autoUpdateMarker, "enabled`n", [Text.UTF8Encoding]::new($false))
@@ -664,13 +707,15 @@ try {
 }
 
 $shortcutPaths = @()
+$shortcutBackups = @()
 if (-not $NoShortcut) {
-    Write-InstallProgress -Percent 98 -Status 'Updating Codex shortcuts'
+    Write-InstallProgress -Percent 98 -Status 'Updating Codex_Fix shortcuts'
     $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
     $shortcutShell = New-Object -ComObject WScript.Shell
+    $shortcutBackupRoot = Join-Path $installRoot ('shortcut-backups\' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
     foreach ($directory in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) {
         if ([string]::IsNullOrWhiteSpace($directory)) { continue }
-        $shortcutPath = Join-Path $directory 'Codex.lnk'
+        $shortcutPath = Join-Path $directory 'Codex_Fix.lnk'
         if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
             if (-not (Test-OwnedLauncherShortcut -Shell $shortcutShell -Path $shortcutPath -LauncherHost $wscript -InstallRoot $installRoot)) {
                 throw "Refusing to overwrite an unrelated shortcut: $shortcutPath"
@@ -678,14 +723,17 @@ if (-not $NoShortcut) {
         }
         New-CodexLauncherShortcut -Shell $shortcutShell -Path $shortcutPath -Target $stableLauncherHost -InstallRoot $installRoot -Icon $stableIcon
         $shortcutPaths += $shortcutPath
-    }
-
-    $programsDirectory = [Environment]::GetFolderPath('Programs')
-    if (-not [string]::IsNullOrWhiteSpace($programsDirectory)) {
-        $legacyStartMenuShortcut = Join-Path $programsDirectory 'ChatGPT.lnk'
-        if (Test-OwnedLauncherShortcut -Shell $shortcutShell -Path $legacyStartMenuShortcut -LauncherHost $wscript -InstallRoot $installRoot) {
-            New-CodexLauncherShortcut -Shell $shortcutShell -Path $legacyStartMenuShortcut -Target $stableLauncherHost -InstallRoot $installRoot -Icon $stableIcon
-            $shortcutPaths += $legacyStartMenuShortcut
+        foreach ($legacy in Get-ChildItem -LiteralPath $directory -Filter '*.lnk' -File) {
+            if ($legacy.FullName -eq $shortcutPath) { continue }
+            if (-not (Test-OwnedLauncherShortcut -Shell $shortcutShell -Path $legacy.FullName -LauncherHost $wscript -InstallRoot $installRoot)) { continue }
+            $scope = if ($directory -eq [Environment]::GetFolderPath('Desktop')) { 'Desktop' } else { 'StartMenu' }
+            $backupDirectory = Join-Path $shortcutBackupRoot $scope
+            $backupPath = Join-Path $backupDirectory $legacy.Name
+            Assert-ExactChildPath -Parent $directory -Child $legacy.FullName | Out-Null
+            Assert-ExactChildPath -Parent $installRoot -Child $backupPath | Out-Null
+            New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
+            Move-Item -LiteralPath $legacy.FullName -Destination $backupPath
+            $shortcutBackups += [pscustomobject]@{ original=$legacy.FullName; backup=$backupPath }
         }
     }
 
@@ -719,5 +767,6 @@ if ($ShowProgress) { Write-Progress -Id 1 -Activity 'Updating Codex Windows SSH'
     validation = $runtimeValidation
     autoUpdateEnabled = $autoUpdateEnabled
     shortcuts = $shortcutPaths
-    instruction = 'Exit every Codex/ChatGPT desktop process, then open Start > Codex. Pin that stable Start entry once if desired; enabled updates are checked, shown, validated, and selected before launch.'
+    shortcutBackups = $shortcutBackups
+    instruction = 'Exit the older patched desktop process, then open Start > Codex_Fix. Pin that stable Start entry once if desired; enabled updates are checked, shown, validated, and selected before launch. Official ChatGPT is a separate entry.'
 } | ConvertTo-Json -Depth 3

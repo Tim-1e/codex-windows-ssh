@@ -33,7 +33,7 @@ if ($running.Count -gt 0) {
 $shortcutShell = New-Object -ComObject WScript.Shell
 foreach ($directory in @([Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('Programs'))) {
     if ([string]::IsNullOrWhiteSpace($directory)) { continue }
-    foreach ($name in @('Codex.lnk', 'ChatGPT.lnk')) {
+    foreach ($name in @('Codex.lnk', 'ChatGPT.lnk', 'win_fix_codex.lnk', 'Codex_Fix.lnk')) {
         $shortcutPath = Join-Path $directory $name
         if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) { continue }
         $shortcut = $shortcutShell.CreateShortcut($shortcutPath)

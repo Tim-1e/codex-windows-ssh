@@ -41,6 +41,12 @@ jobs:
           $env:CODEX_WINDOWS_SSH_LAUNCHER_VALIDATE = '1'
           & "$env:SystemRoot\System32\cscript.exe" //nologo .\Start-Codex.vbs
           if ($LASTEXITCODE -ne 0) { throw "Launcher validation failed: $LASTEXITCODE" }
+      - name: Validate stable shortcut identity
+        shell: pwsh
+        run: ./Test-CodexShortcuts.ps1
+      - name: Validate safe runtime cleanup
+        shell: pwsh
+        run: ./Test-CodexRuntimeCleanup.ps1
       - name: Compile stable taskbar launcher
         shell: pwsh
         run: |
@@ -59,7 +65,7 @@ jobs:
         shell: pwsh
         run: |
           $fixture = Join-Path $env:RUNNER_TEMP ("codex-launcher-" + [guid]::NewGuid().ToString('N'))
-          $runtimeId = '26.901.1978.0-r4'
+          $runtimeId = '26.901.1978.0-r6'
           $app = Join-Path $fixture "$runtimeId\app\ChatGPT.exe"
           New-Item -ItemType Directory -Path (Split-Path -Parent $app) -Force | Out-Null
           [IO.File]::WriteAllBytes($app, [byte[]]@())
